@@ -50,6 +50,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `flush()` of the multi-threaded XZ, LZMA2 and LZIP writers now waits for the pending work, so the flushed data
   reaches the inner writer.
 - Reduce stack usage of `XzWriter` by boxing `FilterWriter` enum variants.
+- `XzWriterMt` now applies the pre-filters set with `XzOptions::prepend_pre_filter` in every block. It named them in
+  the block headers but compressed the bytes unfiltered, so the output decoded to the wrong bytes.
 
 ## 0.20.1 - 2026-08-30
 
