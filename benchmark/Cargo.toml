@@ -1,0 +1,25 @@
+[package]
+name = "lzma-rust2-benchmark"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Single-threaded decoding: the master branch and this branch of lzma-rust2 against liblzma and 7-Zip's decoders"
+license = "Apache-2.0"
+
+# A workspace of its own, like `fuzz`, so that running it leaves the crate's lock file alone.
+[workspace]
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+criterion = { version = "=0.7", features = ["html_reports"] }
+liblzma = { version = "0.4", features = ["static"] }
+# This branch.
+lzma-rust2 = { path = "..", default-features = false, features = ["std", "encoder", "optimization"] }
+# The master branch the branch was made from.
+lzma-rust2-master = { package = "lzma-rust2", git = "https://github.com/hasenbanck/lzma-rust2", rev = "5614fd560e1020e46bd087c6c2b49233e4df952c", default-features = false, features = ["std", "encoder", "optimization"] }
+
+[[bench]]
+name = "decoding"
+harness = false

@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="460" viewBox="0 0 1100 460" font-family="sans-serif" font-size="13">
+<rect width="1100" height="460" fill="#ffffff"/>
+<text x="70" y="24" font-size="16" font-weight="bold">decompression lzma2, MiB/s of output</text>
+<line x1="70" y1="400.0" x2="1080" y2="400.0" stroke="#dddddd"/>
+<text x="62" y="404.0" text-anchor="end">0</text>
+<line x1="70" y1="283.3" x2="1080" y2="283.3" stroke="#dddddd"/>
+<text x="62" y="287.3" text-anchor="end">50</text>
+<line x1="70" y1="166.7" x2="1080" y2="166.7" stroke="#dddddd"/>
+<text x="62" y="170.7" text-anchor="end">100</text>
+<line x1="70" y1="50.0" x2="1080" y2="50.0" stroke="#dddddd"/>
+<text x="62" y="54.0" text-anchor="end">150</text>
+<text x="14" y="225" transform="rotate(-90 14 225)" text-anchor="middle">MiB/s</text>
+<rect x="80.1" y="202.7" width="15.2" height="197.3" fill="#9e9e9e"/>
+<rect x="96.3" y="152.0" width="15.2" height="248.0" fill="#1f77b4"/>
+<rect x="112.4" y="190.7" width="15.2" height="209.3" fill="#2ca02c"/>
+<rect x="128.6" y="182.9" width="15.2" height="217.1" fill="#9467bd"/>
+<rect x="144.7" y="123.9" width="15.2" height="276.1" fill="#d62728"/>
+<text x="120.5" y="418" text-anchor="middle">0</text>
+<rect x="181.1" y="189.9" width="15.2" height="210.1" fill="#9e9e9e"/>
+<rect x="197.3" y="137.2" width="15.2" height="262.8" fill="#1f77b4"/>
+<rect x="213.4" y="180.0" width="15.2" height="220.0" fill="#2ca02c"/>
+<rect x="229.6" y="168.8" width="15.2" height="231.2" fill="#9467bd"/>
+<rect x="245.7" y="107.6" width="15.2" height="292.4" fill="#d62728"/>
+<text x="221.5" y="418" text-anchor="middle">1</text>
+<rect x="282.1" y="180.4" width="15.2" height="219.6" fill="#9e9e9e"/>
+<rect x="298.3" y="126.8" width="15.2" height="273.2" fill="#1f77b4"/>
+<rect x="314.4" y="168.9" width="15.2" height="231.1" fill="#2ca02c"/>
+<rect x="330.6" y="165.8" width="15.2" height="234.2" fill="#9467bd"/>
+<rect x="346.7" y="102.0" width="15.2" height="298.0" fill="#d62728"/>
+<text x="322.5" y="418" text-anchor="middle">2</text>
+<rect x="383.1" y="179.7" width="15.2" height="220.3" fill="#9e9e9e"/>
+<rect x="399.3" y="121.4" width="15.2" height="278.6" fill="#1f77b4"/>
+<rect x="415.4" y="165.3" width="15.2" height="234.7" fill="#2ca02c"/>
+<rect x="431.6" y="157.1" width="15.2" height="242.9" fill="#9467bd"/>
+<rect x="447.7" y="96.0" width="15.2" height="304.0" fill="#d62728"/>
+<text x="423.5" y="418" text-anchor="middle">3</text>
+<rect x="484.1" y="178.9" width="15.2" height="221.1" fill="#9e9e9e"/>
+<rect x="500.3" y="126.9" width="15.2" height="273.1" fill="#1f77b4"/>
+<rect x="516.4" y="167.7" width="15.2" height="232.3" fill="#2ca02c"/>
+<rect x="532.6" y="157.3" width="15.2" height="242.7" fill="#9467bd"/>
+<rect x="548.7" y="94.3" width="15.2" height="305.7" fill="#d62728"/>
+<text x="524.5" y="418" text-anchor="middle">4</text>
+<rect x="585.1" y="175.8" width="15.2" height="224.2" fill="#9e9e9e"/>
+<rect x="601.3" y="126.4" width="15.2" height="273.6" fill="#1f77b4"/>
+<rect x="617.4" y="171.4" width="15.2" height="228.6" fill="#2ca02c"/>
+<rect x="633.6" y="158.1" width="15.2" height="241.9" fill="#9467bd"/>
+<rect x="649.7" y="100.2" width="15.2" height="299.8" fill="#d62728"/>
+<text x="625.5" y="418" text-anchor="middle">5</text>
+<rect x="686.1" y="182.3" width="15.2" height="217.7" fill="#9e9e9e"/>
+<rect x="702.3" y="135.1" width="15.2" height="264.9" fill="#1f77b4"/>
+<rect x="718.4" y="170.3" width="15.2" height="229.7" fill="#2ca02c"/>
+<rect x="734.6" y="169.2" width="15.2" height="230.8" fill="#9467bd"/>
+<rect x="750.7" y="98.0" width="15.2" height="302.0" fill="#d62728"/>
+<text x="726.5" y="418" text-anchor="middle">6</text>
+<rect x="787.1" y="178.2" width="15.2" height="221.8" fill="#9e9e9e"/>
+<rect x="803.3" y="122.7" width="15.2" height="277.3" fill="#1f77b4"/>
+<rect x="819.4" y="160.6" width="15.2" height="239.4" fill="#2ca02c"/>
+<rect x="835.6" y="158.2" width="15.2" height="241.8" fill="#9467bd"/>
+<rect x="851.7" y="91.2" width="15.2" height="308.8" fill="#d62728"/>
+<text x="827.5" y="418" text-anchor="middle">7</text>
+<rect x="888.1" y="174.7" width="15.2" height="225.3" fill="#9e9e9e"/>
+<rect x="904.3" y="122.4" width="15.2" height="277.6" fill="#1f77b4"/>
+<rect x="920.4" y="161.5" width="15.2" height="238.5" fill="#2ca02c"/>
+<rect x="936.6" y="153.5" width="15.2" height="246.5" fill="#9467bd"/>
+<rect x="952.7" y="91.0" width="15.2" height="309.0" fill="#d62728"/>
+<text x="928.5" y="418" text-anchor="middle">8</text>
+<rect x="989.1" y="178.1" width="15.2" height="221.9" fill="#9e9e9e"/>
+<rect x="1005.3" y="123.7" width="15.2" height="276.3" fill="#1f77b4"/>
+<rect x="1021.4" y="160.6" width="15.2" height="239.4" fill="#2ca02c"/>
+<rect x="1037.6" y="153.3" width="15.2" height="246.7" fill="#9467bd"/>
+<rect x="1053.7" y="94.2" width="15.2" height="305.8" fill="#d62728"/>
+<text x="1029.5" y="418" text-anchor="middle">9</text>
+<text x="575" y="430" text-anchor="middle">preset</text>
+<rect x="70" y="442" width="12" height="12" fill="#9e9e9e"/>
+<text x="86" y="452">lzma-rust2 master</text>
+<rect x="246" y="442" width="12" height="12" fill="#1f77b4"/>
+<text x="262" y="452">lzma-rust2 asm</text>
+<rect x="398" y="442" width="12" height="12" fill="#2ca02c"/>
+<text x="414" y="452">liblzma</text>
+<rect x="494" y="442" width="12" height="12" fill="#9467bd"/>
+<text x="510" y="452">7-Zip (C)</text>
+<rect x="606" y="442" width="12" height="12" fill="#d62728"/>
+<text x="622" y="452">7-Zip (asm)</text>
+</svg>
