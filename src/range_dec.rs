@@ -39,6 +39,14 @@ impl<R> RangeDecoder<R> {
         }
     }
 
+    /// Takes the range and code back from a decoder that ran over the bytes
+    /// itself.
+    #[cfg(all(feature = "optimization", target_arch = "aarch64"))]
+    pub(crate) fn set_state(&mut self, state: RangeCoderState) {
+        self.range = state.range;
+        self.code = state.code;
+    }
+
     pub(crate) fn into_inner(self) -> R {
         self.inner
     }

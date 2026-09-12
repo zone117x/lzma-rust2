@@ -24,6 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ones, and reported corrupt data at best.
 - `LzipReader` keeps the bytes its LZMA reader read ahead, so a member's trailer and the members after it are read from
   them first.
+- On aarch64 the `optimization` feature now decodes LZMA through inline assembly kernels for the literal, the matched
+  literal, the bit trees and the reverse bit trees, which load both children of a tree node before the bit that
+  chooses between them is known, the trick of the LZMA SDK's arm64 decoder. The decoder that carries them keeps its
+  probabilities in the layout of 7-Zip's `LzmaDec.c`, and the range coder's and the window's state in locals over a
+  run of symbols. It decodes about 1.25 times faster than the Rust decoder; other targets keep the decoder they had.
 - The reserved bits of the XZ stream header flags are now all checked, and come back as `Unsupported` instead of
   `InvalidData`. The format checksums those flags on their own so that a decoder can tell a corrupt file from one it
   does not support, and a set reserved bit fits an `Unsupported` error better.

@@ -73,6 +73,34 @@ impl LzDecoder {
         self.pending_len > 0
     }
 
+    /// How many bytes the window holds: its position before it first wraps,
+    /// its whole size after.
+    pub(crate) fn full(&self) -> usize {
+        self.full
+    }
+
+    /// The window with its counters in the open, for a decoder that keeps
+    /// them in locals over a run of symbols; [`set_counters`](Self::set_counters)
+    /// takes them back.
+    pub(crate) fn parts(&mut self) -> WindowParts<'_> {
+        WindowParts {
+            buf: &mut self.buf,
+            buf_size: self.buf_size,
+            pos: self.pos,
+            full: self.full,
+            limit: self.limit,
+            pending_len: self.pending_len,
+            pending_dist: self.pending_dist,
+        }
+    }
+
+    pub(crate) fn set_counters(&mut self, counters: WindowCounters) {
+        self.pos = counters.pos;
+        self.full = counters.full;
+        self.pending_len = counters.pending_len;
+        self.pending_dist = counters.pending_dist;
+    }
+
     pub(crate) fn get_pos(&self) -> usize {
         self.pos
     }
@@ -99,58 +127,11 @@ impl LzDecoder {
     }
 
     pub(crate) fn repeat(&mut self, dist: usize, len: usize) -> crate::Result<()> {
-        if dist >= self.full {
-            return Err(error_other("dist overflow"));
-        }
-        let mut left = usize::min(self.limit - self.pos, len);
-        self.pending_len = len - left;
-        self.pending_dist = dist;
-
-        let back = if self.pos < dist + 1 {
-            // The distance wraps around to the end of the cyclic dictionary
-            // buffer. We cannot get here if the dictionary isn't full.
-            debug_assert_eq!(self.full, self.buf_size);
-            let mut back = self.buf_size + self.pos - dist - 1;
-
-            let copy_size = usize::min(self.buf_size - back, left);
-            self.buf.copy_within(back..back + copy_size, self.pos);
-            self.pos += copy_size;
-            back = 0;
-            left -= copy_size;
-
-            if left == 0 {
-                return Ok(());
-            }
-
-            back
-        } else {
-            self.pos - dist - 1
-        };
-
-        debug_assert!(back < self.pos);
-        debug_assert!(left > 0);
-
-        if dist >= left {
-            // No overlap possible. We can copy directly.
-            let (src_part, dst_part) = self.buf.split_at_mut(self.pos);
-            dst_part[..left].copy_from_slice(&src_part[back..back + left]);
-            self.pos += left;
-        } else {
-            loop {
-                let copy_size = left.min(self.pos - back);
-                self.buf.copy_within(back..back + copy_size, self.pos);
-                self.pos += copy_size;
-                left -= copy_size;
-                if left == 0 {
-                    break;
-                }
-            }
-        }
-
-        if self.full < self.pos {
-            self.full = self.pos;
-        }
-        Ok(())
+        let mut parts = self.parts();
+        let result = parts.repeat(dist, len);
+        let counters = parts.counters();
+        self.set_counters(counters);
+        result
     }
 
     pub(crate) fn repeat_pending(&mut self) -> crate::Result<()> {
@@ -239,5 +220,134 @@ mod tests {
     fn ensure_capacity_rejects_impossible_size() {
         let mut lz = LzDecoder::new(usize::MAX, None);
         assert!(lz.ensure_capacity().is_err());
+    }
+}
+
+/// The counters of a [`WindowParts`], to give back to the window.
+#[derive(Clone, Copy)]
+pub(crate) struct WindowCounters {
+    pos: usize,
+    full: usize,
+    pending_len: usize,
+    pending_dist: usize,
+}
+
+/// The window's buffer and counters, apart from the window: the symbol
+/// decoder works on these, and a decoder that runs inline assembly keeps
+/// them in locals across it, where a field of the window would be written
+/// and read back around every kernel.
+pub(crate) struct WindowParts<'a> {
+    buf: &'a mut [u8],
+    buf_size: usize,
+    pos: usize,
+    full: usize,
+    limit: usize,
+    pending_len: usize,
+    pending_dist: usize,
+}
+
+impl WindowParts<'_> {
+    #[inline(always)]
+    pub(crate) fn counters(&self) -> WindowCounters {
+        WindowCounters {
+            pos: self.pos,
+            full: self.full(),
+            pending_len: self.pending_len,
+            pending_dist: self.pending_dist,
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn has_space(&self) -> bool {
+        self.pos < self.limit
+    }
+
+    #[inline(always)]
+    pub(crate) fn get_pos(&self) -> usize {
+        self.pos
+    }
+
+    /// How many bytes the window holds: its position before it first wraps,
+    /// its whole size after. The fill is not kept up to date byte by byte:
+    /// the position counts.
+    #[inline(always)]
+    pub(crate) fn full(&self) -> usize {
+        self.full.max(self.pos)
+    }
+
+    #[inline(always)]
+    pub(crate) fn get_byte(&self, dist: usize) -> u8 {
+        let offset = if dist >= self.pos {
+            self.buf_size
+                .saturating_add(self.pos)
+                .saturating_sub(dist)
+                .saturating_sub(1)
+        } else {
+            self.pos.saturating_sub(dist).saturating_sub(1)
+        };
+
+        self.buf.get(offset).copied().unwrap_or(0)
+    }
+
+    #[inline(always)]
+    pub(crate) fn put_byte(&mut self, b: u8) {
+        self.buf[self.pos] = b;
+        self.pos += 1;
+    }
+
+    #[inline(always)]
+    pub(crate) fn repeat(&mut self, dist: usize, len: usize) -> crate::Result<()> {
+        if dist >= self.full() {
+            return Err(error_other("dist overflow"));
+        }
+        let mut left = usize::min(self.limit - self.pos, len);
+        self.pending_len = len - left;
+        self.pending_dist = dist;
+
+        let back = if self.pos < dist + 1 {
+            // The distance wraps around to the end of the cyclic dictionary
+            // buffer. We cannot get here if the dictionary isn't full.
+            debug_assert_eq!(self.full(), self.buf_size);
+            let mut back = self.buf_size + self.pos - dist - 1;
+
+            let copy_size = usize::min(self.buf_size - back, left);
+            self.buf.copy_within(back..back + copy_size, self.pos);
+            self.pos += copy_size;
+            back = 0;
+            left -= copy_size;
+
+            if left == 0 {
+                return Ok(());
+            }
+
+            back
+        } else {
+            self.pos - dist - 1
+        };
+
+        debug_assert!(back < self.pos);
+        debug_assert!(left > 0);
+
+        if dist >= left {
+            // No overlap possible. We can copy directly.
+            let (src_part, dst_part) = self.buf.split_at_mut(self.pos);
+            dst_part[..left].copy_from_slice(&src_part[back..back + left]);
+            self.pos += left;
+        } else {
+            loop {
+                let copy_size = left.min(self.pos - back);
+                self.buf.copy_within(back..back + copy_size, self.pos);
+                self.pos += copy_size;
+                left -= copy_size;
+                if left == 0 {
+                    break;
+                }
+            }
+        }
+
+        if self.full < self.pos {
+            self.full = self.pos;
+        }
+        Ok(())
     }
 }
