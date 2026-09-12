@@ -262,6 +262,25 @@ impl WindowParts<'_> {
         self.pos < self.limit
     }
 
+    /// The window's buffer, position, limit, fill and size, for a kernel
+    /// that decodes straight into it; [`set_pos`](Self::set_pos) takes the
+    /// position back.
+    #[inline(always)]
+    pub(crate) fn raw_parts(&mut self) -> (*mut u8, usize, usize, usize, usize) {
+        (
+            self.buf.as_mut_ptr(),
+            self.pos,
+            self.limit,
+            self.full(),
+            self.buf_size,
+        )
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_pos(&mut self, pos: usize) {
+        self.pos = pos;
+    }
+
     #[inline(always)]
     pub(crate) fn get_pos(&self) -> usize {
         self.pos
@@ -289,6 +308,13 @@ impl WindowParts<'_> {
         self.buf.get(offset).copied().unwrap_or(0)
     }
 
+    /// The byte before the position, for the literal context after a copy,
+    /// which leaves the position past at least one byte.
+    #[inline(always)]
+    pub(crate) fn last_byte(&self) -> u8 {
+        self.buf[self.pos - 1]
+    }
+
     #[inline(always)]
     pub(crate) fn put_byte(&mut self, b: u8) {
         self.buf[self.pos] = b;
@@ -299,6 +325,33 @@ impl WindowParts<'_> {
     pub(crate) fn repeat(&mut self, dist: usize, len: usize) -> crate::Result<()> {
         if dist >= self.full() {
             return Err(error_other("dist overflow"));
+        }
+        // The common case first, in one test: a match shorter than a double
+        // word, whose source lies that far behind without wrapping, with
+        // that much room in the window and inside the limit. It is copied as
+        // one double word read from the source and one from the destination,
+        // with the destination's own bytes past the match kept, so that there
+        // is no loop and no call for the few bytes most matches are.
+        let pos = self.pos;
+        if len < 16
+            && dist + 1 <= pos
+            && dist + 1 >= 16
+            && pos + 16 <= self.buf_size
+            && pos + len <= self.limit
+        {
+            let back = pos - dist - 1;
+            let mut src = [0; 16];
+            src.copy_from_slice(&self.buf[back..back + 16]);
+            let mut dst = [0; 16];
+            dst.copy_from_slice(&self.buf[pos..pos + 16]);
+            let keep = u128::MAX << (8 * len);
+            let word = (u128::from_le_bytes(dst) & keep) | (u128::from_le_bytes(src) & !keep);
+            self.buf[pos..pos + 16].copy_from_slice(&word.to_le_bytes());
+            self.pos = pos + len;
+            // The whole match is copied, so nothing is pending, which matters
+            // when this was the pending rest of a match the limit had cut.
+            self.pending_len = 0;
+            return Ok(());
         }
         let mut left = usize::min(self.limit - self.pos, len);
         self.pending_len = len - left;
