@@ -5,11 +5,14 @@ the crate's README measures it, by five decoders over the same compressed bytes:
 
 - **lzma-rust2 master**: the master branch this branch was made from, as a git
   dependency.
-- **lzma-rust2 asm**: this branch, whose `optimization` feature decodes the
-  literal, the matched literal and the bit trees through inline assembly
-  kernels on aarch64, which load both children of a tree node before the bit
-  that chooses between them is known (the trick of the LZMA SDK's arm64
-  decoder), and whose `LzmaReader` reads its input through a buffer.
+- **lzma-rust2 asm**: this branch, whose `optimization` feature decodes LZMA
+  on aarch64 through one inline assembly kernel that owns the symbol loop: the
+  range coder, the window position, the state and the repeat distance stay in
+  registers from one symbol to the next, both children of a tree node are
+  loaded before the bit that chooses between them is known (the trick of the
+  LZMA SDK's arm64 decoder), and a matched literal's candidates are loaded two
+  bits ahead, where the SDK loads after each bit. Its `LzmaReader` reads its
+  input through a buffer.
 - **liblzma**: the `liblzma` crate over the C library of the same name.
 - **7-Zip (C)**: the LZMA SDK's `LzmaDec.c` and `Lzma2Dec.c` as shipped in
   7-Zip 26.02 (`lzma-sdk/`, public domain).
@@ -40,42 +43,41 @@ of 20 samples.
 
 ### decompression lzma2
 
-This branch decodes 1.2 to 1.25 times faster than master and about 1.15 times
-faster than liblzma. 7-Zip's own arm64 build, whose whole decoding loop is
-assembly with nothing between bits leaving the registers, stays about 10%
-ahead of kernels called from Rust.
+This branch decodes 1.5 times faster than master, 1.4 times faster than
+liblzma, and about 1.1 times faster than 7-Zip's own arm64 build, whose whole
+decoding loop is the SDK's assembly.
 
 | preset | lzma-rust2 master | lzma-rust2 asm | liblzma | 7-Zip (C) | 7-Zip (asm) |
 |---|---:|---:|---:|---:|---:|
-| 0 | 85 | 106 | 90 | 93 | 118 |
-| 1 | 90 | 113 | 94 | 99 | 125 |
-| 2 | 94 | 117 | 99 | 100 | 128 |
-| 3 | 94 | 119 | 101 | 104 | 130 |
-| 4 | 95 | 117 | 100 | 104 | 131 |
-| 5 | 96 | 117 | 98 | 104 | 128 |
-| 6 | 93 | 114 | 98 | 99 | 129 |
-| 7 | 95 | 119 | 103 | 104 | 132 |
-| 8 | 97 | 119 | 102 | 106 | 132 |
-| 9 | 95 | 118 | 103 | 106 | 131 |
+| 0 | 86 | 131 | 92 | 95 | 120 |
+| 1 | 93 | 140 | 97 | 101 | 128 |
+| 2 | 96 | 146 | 101 | 105 | 133 |
+| 3 | 100 | 150 | 104 | 108 | 137 |
+| 4 | 99 | 149 | 104 | 108 | 136 |
+| 5 | 102 | 153 | 107 | 111 | 140 |
+| 6 | 102 | 154 | 108 | 112 | 141 |
+| 7 | 103 | 154 | 109 | 113 | 142 |
+| 8 | 103 | 154 | 109 | 114 | 142 |
+| 9 | 103 | 155 | 109 | 112 | 141 |
 
 ![decompression lzma2](./assets/decompression_lzma2.svg)
 
 ### decompression lzma
 
 The same through `LzmaReader`, which on this branch reads its input through a
-buffer and so decodes through the kernels too.
+buffer and so decodes through the kernel too.
 
 | preset | lzma-rust2 master | lzma-rust2 asm | liblzma | 7-Zip (C) | 7-Zip (asm) |
 |---|---:|---:|---:|---:|---:|
-| 0 | 86 | 106 | 89 | 92 | 115 |
-| 1 | 88 | 108 | 91 | 96 | 124 |
-| 2 | 93 | 114 | 97 | 101 | 128 |
-| 3 | 94 | 110 | 98 | 100 | 122 |
-| 4 | 90 | 110 | 95 | 99 | 124 |
-| 5 | 91 | 111 | 96 | 99 | 124 |
-| 6 | 91 | 111 | 97 | 100 | 123 |
-| 7 | 92 | 110 | 96 | 100 | 120 |
-| 8 | 92 | 109 | 96 | 100 | 124 |
-| 9 | 93 | 110 | 97 | 100 | 123 |
+| 0 | 87 | 132 | 92 | 95 | 121 |
+| 1 | 93 | 140 | 97 | 101 | 128 |
+| 2 | 96 | 146 | 101 | 105 | 134 |
+| 3 | 100 | 150 | 104 | 108 | 138 |
+| 4 | 99 | 149 | 104 | 108 | 136 |
+| 5 | 102 | 153 | 107 | 111 | 139 |
+| 6 | 102 | 154 | 108 | 112 | 140 |
+| 7 | 102 | 154 | 108 | 111 | 140 |
+| 8 | 103 | 154 | 108 | 112 | 140 |
+| 9 | 103 | 153 | 108 | 111 | 140 |
 
 ![decompression lzma](./assets/decompression_lzma.svg)
