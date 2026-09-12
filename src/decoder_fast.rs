@@ -1,25 +1,26 @@
 //! The LZMA decoder for aarch64 with the `optimization` feature: the same
 //! algorithm as [`decoder`](crate::decoder), with its probabilities in one
-//! array in the layout of 7-Zip's `LzmaDec.c`, so that the bit trees, the
-//! literal and the matched literal are runs of adjacent probabilities a
-//! kernel can walk.
+//! array in the layout of 7-Zip's `LzmaDec.c`, so that every bit tree, the
+//! literal and the matched literal are runs of adjacent probabilities.
 //!
-//! Over buffered input the symbols are decoded by [`Coder`], which holds the
-//! range coder's state in locals for the whole run, so that it stays in
-//! registers, and decodes those runs of bits with inline assembly kernels
-//! that load both children of a tree node before the bit that chooses
-//! between them is known. That is the trick of the LZMA SDK's arm64 decoder,
-//! and it is worth a third over the same loops in Rust, where the next
-//! probability is loaded only once the bit has been decided. Over input that
-//! arrives a byte at a time, and for the last bytes of a buffer, the same
-//! symbols are decoded through the [`RangeDecoder`] as [`Bits`]. The choice
-//! of symbol, the state machine, the distances and the copies are Rust
-//! either way.
+//! Over buffered input the symbols are decoded by one inline assembly
+//! kernel that owns the loop, [`Coder::run`]: the range coder, the window's
+//! position, the state and the repeat distances stay in registers from one
+//! symbol to the next, the probabilities of both children of a tree node
+//! are loaded before the bit that chooses between them is known, and the
+//! decision bits are taken with branches. That is how the LZMA SDK's arm64
+//! decoder is built, and a kernel called per run of bits from Rust, tried
+//! first, gave a third of the gain away in the state it had to store and
+//! reload around every call. The kernel is written from the step macros
+//! below, so that each phase reads as the tree, the literal or the copy it
+//! is. It hands a copy that wraps the window or runs past the output limit
+//! to Rust, and the last bytes of a buffer, and input that arrives a byte at
+//! a time, are decoded by the same symbol decoder in Rust.
 
 use alloc::{vec, vec::Vec};
 
 use crate::{
-    BIT_MODEL_TOTAL, BIT_MODEL_TOTAL_BITS, MOVE_BITS, SHIFT_BITS, TOP_VALUE, error_other,
+    BIT_MODEL_TOTAL, BIT_MODEL_TOTAL_BITS, MOVE_BITS, SHIFT_BITS, error_other,
     lz::{LzDecoder, WindowParts},
     lzma_reader::IN_REQUIRED,
     range_dec::{RangeCoderState, RangeDecoder, RangeReader},
@@ -71,137 +72,33 @@ const PROB_INIT: u16 = 1024;
 /// `prob - (prob >> 5)` for a 1.
 const BIT_MODEL_OFFSET: u32 = BIT_MODEL_TOTAL - (1 << MOVE_BITS) + 1;
 
-/// What the symbol decoder needs of a range coder: single bits and the runs
-/// of bits the layout keeps adjacent.
-trait Bits {
-    fn bit(&mut self, prob: &mut u16) -> u32;
-
-    /// A bit tree of `probs.len()` leaves, a power of two; the leaf. Index 0
-    /// is not used.
-    fn tree(&mut self, probs: &mut [u16]) -> u32;
-
-    /// The eight-bit tree of a literal, over the first 0x100 of a literal
-    /// coder's probabilities.
-    fn literal(&mut self, probs: &mut [u16]) -> u32;
-
-    /// A literal against `match_byte`, over the 0x300 probabilities of one
-    /// literal coder, the way `LzmaDec.c` indexes them.
-    fn matched_literal(&mut self, probs: &mut [u16], match_byte: u32) -> u32;
-
-    /// `count` bits of a reverse bit tree from node `start`, walked as 7-Zip's
-    /// `REV_BIT` walks it: each bit moves to `node + step` for a 0 or `node +
-    /// 2 * step` for a 1, and the step doubles. Returns the node reached; the
-    /// value is that less `1 << count`.
-    fn reverse(&mut self, probs: &mut [u16], start: u32, count: u32) -> u32;
-
-    fn direct_bits(&mut self, count: u32) -> u32;
-
-    /// Everything of a match after its is-match bit, when the coder decodes
-    /// it whole: the length in bytes and the kind, with the state and the
-    /// repeat distances updated in `st`. `None` leaves it to the caller.
-    #[inline(always)]
-    fn match_head(
-        &mut self,
-        _probs: &mut [u16],
-        _st: &mut Symbols,
-        _pos_state: usize,
-    ) -> Option<(u32, MatchKind)> {
-        None
-    }
+/// The state of a run of symbols, in locals: the state as 7-Zip counts it
+/// (0 to 11), the repeat distances as 7-Zip keeps them (the distance plus
+/// one), and the masks of the properties.
+struct Symbols {
+    state: u32,
+    reps: [u32; 4],
+    /// The last byte of the output, the literal context; 0 before the first.
+    previous: u32,
+    lc: u32,
+    lp_mask: u32,
+    pb_mask: u32,
+    end_marker: bool,
+    /// The length of a match the kernel left for Rust to copy.
+    pending: u32,
 }
 
-/// The loops in Rust, over any reader.
-impl<R: RangeReader> Bits for RangeDecoder<R> {
-    #[inline(always)]
-    fn bit(&mut self, prob: &mut u16) -> u32 {
-        self.decode_bit(prob) as u32
-    }
-
-    #[inline(always)]
-    fn tree(&mut self, probs: &mut [u16]) -> u32 {
-        let limit = probs.len();
-        let mut i = 1usize;
-        while i < limit {
-            // The mask is a no-op on the index and lets the bounds check go.
-            i = (i << 1) | self.decode_bit(&mut probs[i & (limit - 1)]) as usize;
-        }
-        (i - limit) as u32
-    }
-
-    #[inline(always)]
-    fn literal(&mut self, probs: &mut [u16]) -> u32 {
-        self.tree(probs)
-    }
-
-    #[inline(always)]
-    fn matched_literal(&mut self, probs: &mut [u16], match_byte: u32) -> u32 {
-        let mut match_byte = match_byte;
-        let mut offs = 0x100u32;
-        let mut symbol = 1u32;
-        while symbol < 0x100 {
-            match_byte += match_byte;
-            let bit = offs;
-            offs &= match_byte;
-            let decoded = self.decode_bit(&mut probs[(offs + bit + symbol) as usize]) as u32;
-            symbol = (symbol << 1) | decoded;
-            if decoded == 0 {
-                offs ^= bit;
-            }
-        }
-        symbol - 0x100
-    }
-
-    #[inline(always)]
-    fn reverse(&mut self, probs: &mut [u16], start: u32, count: u32) -> u32 {
-        let mut node = start;
-        let mut step = 1u32;
-        for _ in 0..count {
-            let bit = self.decode_bit(&mut probs[node as usize]) as u32;
-            step += step;
-            node += if bit == 0 { step >> 1 } else { step };
-        }
-        node
-    }
-
-    #[inline(always)]
-    fn direct_bits(&mut self, count: u32) -> u32 {
-        self.decode_direct_bits(count) as u32
-    }
-}
-
-/// The range coder over a buffer, its state in locals: the kernels take it
-/// through registers and give it back the same way, and nothing between them
-/// has to go through memory.
-struct Coder<'a> {
-    range: u32,
-    code: u32,
-    pos: usize,
-    buf: &'a [u8],
-}
-
-impl Coder<'_> {
-    /// Whether a whole symbol, twenty bytes at most, is sure to be in the
-    /// buffer from `pos`. The kernels read past `pos` freely up to that many.
-    #[inline(always)]
-    fn has_symbol(&self) -> bool {
-        self.pos + IN_REQUIRED <= self.buf.len()
-    }
-}
-
-// The one normalisation every kernel does before a bit: pull a byte in when
-// the range's top byte is clear. The read is clamped to the buffer's last
-// byte, so that a symbol running past the input reads that byte again and
-// the caller, seeing the position past the end, reports the truncation.
+// The one normalisation before every bit: pull a byte in when the range's
+// top byte is clear. The read is not checked: a symbol starts only with
+// twenty bytes left in the buffer and takes at most twenty, so it never
+// reaches past the last.
 macro_rules! normalize {
     () => {
         concat!(
             "tst    {range:w}, #0xFF000000\n",
             "b.ne   3f\n",
             "lsl    {range:w}, {range:w}, #{shift_bits}\n",
-            "cmp    {pos}, {last}\n",
-            "csel   {t}, {last}, {pos}, hi\n",
-            "ldrb   {t:w}, [{buf}, {t}]\n",
-            "add    {pos}, {pos}, #1\n",
+            "ldrb   {t:w}, [{pos}], #1\n",
             "orr    {code:w}, {t:w}, {code:w}, lsl #{shift_bits}\n",
             "3:\n",
         )
@@ -259,6 +156,46 @@ macro_rules! branch_bit {
     };
 }
 
+// The same with the probability loaded already, into `prob`.
+macro_rules! branch_bit_loaded {
+    ($tab:literal, $off:literal, $one:literal) => {
+        concat!(
+            normalize!(),
+            "lsr    {t:w}, {range:w}, #{total_bits}\n",
+            "mul    {t:w}, {t:w}, {prob:w}\n",
+            "cmp    {code:w}, {t:w}\n",
+            "b.hs   ",
+            $one,
+            "f\n",
+            "mov    {range:w}, {t:w}\n",
+            "sub    {u:w}, {prob:w}, #{offset}\n",
+            "sub    {u:w}, {prob:w}, {u:w}, asr #{move_bits}\n",
+            "strh   {u:w}, [",
+            $tab,
+            ", #",
+            $off,
+            "]\n",
+        )
+    };
+}
+
+// The is-match table of the next symbol, from the position and the state
+// as they will be, into `step`, and its probability into `prob`: computed
+// while the current symbol is still being decoded, so that the next symbol
+// starts with the load done.
+macro_rules! next_is_match {
+    ($pos:literal) => {
+        concat!(
+            "ubfx   {t}, {masks}, #8, #8\n",
+            "and    {step}, {t}, ",
+            $pos,
+            ", lsl #{pos_bits}\n",
+            "add    {step}, {probs}, {step}, lsl #1\n",
+            "add    {step}, {step}, {state}, lsl #1\n",
+        )
+    };
+}
+
 // The 1 path of `branch_bit`: the range and the code both lose the bound,
 // the probability falls.
 macro_rules! branch_bit_one {
@@ -276,54 +213,130 @@ macro_rules! branch_bit_one {
     };
 }
 
-// One step of a bit tree over the table in the register named, unrolled:
-// the children of the node loaded before the bit is known, the bit decided,
-// the probability stored, and the walk taken down to the child chosen.
-macro_rules! tree_step {
+// A whole tree of three bits over the table named, from node 1, with the
+// first probability loaded here.
+macro_rules! tree3 {
     ($tab:literal) => {
         concat!(
-            normalize!(),
-            "add    {t}, ",
+            "mov    {sym:w}, #1\n",
+            "ldrh   {prob:w}, [",
             $tab,
-            ", {sym}, lsl #2\n",
-            "ldrh   {p0:w}, [{t}]\n",
-            "ldrh   {p1:w}, [{t}, #2]\n",
-            decide!(),
-            "strh   {u:w}, [",
+            ", #2]\n",
+            "add    {tab2}, ",
             $tab,
-            ", {sym}, lsl #1]\n",
-            "csel   {prob:w}, {p1:w}, {p0:w}, hs\n",
-            "adc    {sym:w}, {sym:w}, {sym:w}\n",
+            ", #2\n",
+            sdk_step!($tab),
+            sdk_step!($tab),
+            sdk_last_step!($tab),
         )
     };
 }
 
-// The last step of a tree, which has no children to load.
-macro_rules! tree_last_step {
+// A whole tree of six bits.
+macro_rules! tree6 {
     ($tab:literal) => {
         concat!(
-            normalize!(),
-            decide!(),
-            "strh   {u:w}, [",
+            "mov    {sym:w}, #1\n",
+            "ldrh   {prob:w}, [",
             $tab,
-            ", {sym}, lsl #1]\n",
-            "adc    {sym:w}, {sym:w}, {sym:w}\n",
+            ", #2]\n",
+            "add    {tab2}, ",
+            $tab,
+            ", #2\n",
+            sdk_step!($tab),
+            sdk_step!($tab),
+            sdk_step!($tab),
+            sdk_step!($tab),
+            sdk_step!($tab),
+            sdk_last_step!($tab),
         )
     };
 }
 
-// A step of a tree kernel for each token given, so that a kernel can be
-// unrolled to its depth.
-macro_rules! tree_step_for {
-    ($tab:literal, $_:tt) => {
-        tree_step!($tab)
+// One step of a bit tree over the table named, in the shape of the SDK's,
+// which decodes measurably faster than a step of the same instructions in
+// another order: the node index kept doubled, the children loaded by
+// register offset from the table and from the table plus one probability
+// (`tab2`), the code's remainder and the probability update in temporaries
+// of their own. The children are loaded before the bit is known, so that
+// the load is off the critical path.
+macro_rules! sdk_step {
+    ($tab:literal) => {
+        concat!(
+            normalize!(),
+            "lsr    {t:w}, {range:w}, #{total_bits}\n",
+            "add    {sym:w}, {sym:w}, {sym:w}\n",
+            "sub    {u:w}, {prob:w}, #{offset}\n",
+            "mul    {t:w}, {t:w}, {prob:w}\n",
+            "ldrh   {p1:w}, [",
+            $tab,
+            ", {sym}, lsl #1]\n",
+            "subs   {v:w}, {code:w}, {t:w}\n",
+            "sub    {range:w}, {range:w}, {t:w}\n",
+            "csel   {range:w}, {t:w}, {range:w}, lo\n",
+            "csel   {u:w}, {prob:w}, {u:w}, hs\n",
+            "ldrh   {t:w}, [{tab2}, {sym}, lsl #1]\n",
+            "sub    {u:w}, {prob:w}, {u:w}, asr #{move_bits}\n",
+            "csel   {prob:w}, {p1:w}, {t:w}, lo\n",
+            "csel   {code:w}, {v:w}, {code:w}, hs\n",
+            "strh   {u:w}, [",
+            $tab,
+            ", {sym}]\n",
+            "adc    {sym:w}, {sym:w}, wzr\n",
+        )
     };
 }
 
-// A step of a reverse tree kernel over the table named: the nodes a 0 and a
-// 1 lead to and their probabilities loaded before the bit is known, the bit
+// The SDK's last step: no children.
+macro_rules! sdk_last_step {
+    ($tab:literal) => {
+        concat!(
+            normalize!(),
+            "lsr    {t:w}, {range:w}, #{total_bits}\n",
+            "add    {sym:w}, {sym:w}, {sym:w}\n",
+            "sub    {u:w}, {prob:w}, #{offset}\n",
+            "mul    {t:w}, {t:w}, {prob:w}\n",
+            "subs   {v:w}, {code:w}, {t:w}\n",
+            "sub    {range:w}, {range:w}, {t:w}\n",
+            "csel   {range:w}, {t:w}, {range:w}, lo\n",
+            "csel   {u:w}, {prob:w}, {u:w}, hs\n",
+            "csel   {code:w}, {v:w}, {code:w}, hs\n",
+            "sub    {u:w}, {prob:w}, {u:w}, asr #{move_bits}\n",
+            "strh   {u:w}, [",
+            $tab,
+            ", {sym}]\n",
+            "adc    {sym:w}, {sym:w}, wzr\n",
+        )
+    };
+}
+
+// A whole tree of eight bits.
+macro_rules! tree8 {
+    ($tab:literal) => {
+        concat!(
+            "mov    {sym:w}, #1\n",
+            "ldrh   {prob:w}, [",
+            $tab,
+            ", #2]\n",
+            "add    {tab2}, ",
+            $tab,
+            ", #2\n",
+            sdk_step!($tab),
+            sdk_step!($tab),
+            sdk_step!($tab),
+            sdk_step!($tab),
+            sdk_step!($tab),
+            sdk_step!($tab),
+            sdk_step!($tab),
+            sdk_last_step!($tab),
+        )
+    };
+}
+
+// A step of a reverse tree over the table named: the nodes a 0 and a 1 lead
+// to and their probabilities loaded before the bit is known, the bit
 // decided, the probability stored, and the walk taken to the node chosen.
-// The node is `sym`.
+// The node is `sym`, the step `step`.
 macro_rules! reverse_step {
     ($tab:literal) => {
         concat!(
@@ -364,188 +377,333 @@ macro_rules! reverse_last_step {
     };
 }
 
-// An unrolled tree kernel: one step per token in the list, then the last
-// step, over a tree of that many bits plus one.
-macro_rules! unrolled_tree {
-    ($name:ident, $bits:literal, [$($step:tt),*]) => {
-        /// A bit tree of this many bits, unrolled.
-        #[inline(always)]
-        fn $name(&mut self, probs: &mut [u16]) -> u32 {
-            debug_assert_eq!(probs.len(), 1 << $bits);
-            let mut sym: u64 = 1;
-
-            // SAFETY: the node visited at each step is `sym`, below the number
-            // of leaves, and the children loaded ahead by every step but the
-            // last are below it too. Every input read is clamped to the
-            // buffer's last byte. The assembly touches no stack and only the
-            // memory named.
-            unsafe {
-                core::arch::asm!(
-                    $(tree_step_for!("{probs}", $step),)*
-                    tree_last_step!("{probs}"),
-                    range = inout(reg) self.range,
-                    code = inout(reg) self.code,
-                    pos = inout(reg) self.pos,
-                    sym = inout(reg) sym,
-                    probs = in(reg) probs.as_mut_ptr(),
-                    buf = in(reg) self.buf.as_ptr(),
-                    last = in(reg) self.buf.len() - 1,
-                    prob = inout(reg) u32::from(probs[1]) => _,
-                    p0 = out(reg) _,
-                    p1 = out(reg) _,
-                    t = out(reg) _,
-                    u = out(reg) _,
-                    shift_bits = const SHIFT_BITS,
-                    total_bits = const BIT_MODEL_TOTAL_BITS,
-                    move_bits = const MOVE_BITS,
-                    offset = const BIT_MODEL_OFFSET,
-                    options(nostack),
-                );
-            }
-            sym as u32 - (1 << $bits)
-        }
+// The matched literal in the shape of the SDK's, which like the tree step
+// decodes measurably faster than the same instructions in another order.
+// The match byte's next bit picks the coder: the index is `offs + bit +
+// sym`, where `bit` is the offset so far and `offs` keeps it only while the
+// match byte's bit is set, and a decoded 0 that disagrees with the match
+// byte drops the offset. The table pointer `step` carries `offs + bit` from
+// one step to the next, the match byte is `cnt`, shifted up as it goes, the
+// match bit's mask `n1`, the offset `n0`.
+macro_rules! matched_first {
+    () => {
+        concat!(
+            "lsl    {cnt:w}, {cnt:w}, #2\n",
+            "and    {n1:w}, {cnt:w}, #0x200\n",
+            "add    {step}, {tab}, #0x202\n",
+            "add    {cnt:w}, {cnt:w}, {cnt:w}\n",
+            "add    {step}, {step}, {n1}\n",
+            "eor    {n0:w}, {n1:w}, #0x200\n",
+            "ldrh   {prob:w}, [{step}]\n",
+            normalize!(),
+            "lsr    {t:w}, {range:w}, #{total_bits}\n",
+            "sub    {u:w}, {prob:w}, #{offset}\n",
+            "mul    {t:w}, {t:w}, {prob:w}\n",
+            "subs   {v:w}, {code:w}, {t:w}\n",
+            "sub    {range:w}, {range:w}, {t:w}\n",
+            "csel   {n0:w}, {n1:w}, {n0:w}, hs\n",
+            "csel   {range:w}, {t:w}, {range:w}, lo\n",
+            "and    {n1:w}, {cnt:w}, {n0:w}\n",
+            "csel   {u:w}, {prob:w}, {u:w}, hs\n",
+            "csel   {code:w}, {v:w}, {code:w}, hs\n",
+            "mov    {sym:w}, #2\n",
+            "sub    {u:w}, {prob:w}, {u:w}, asr #{move_bits}\n",
+            "strh   {u:w}, [{step}]\n",
+            "add    {step}, {tab}, {n0}\n",
+            "adc    {sym:w}, {sym:w}, wzr\n",
+        )
     };
 }
 
-/// What the match head kernel found: the kind of match, the length in
-/// bytes, and the distance plus one as the first repeat distance.
+macro_rules! matched_step {
+    () => {
+        concat!(
+            "add    {step}, {step}, {n1}\n",
+            "eor    {n0:w}, {n0:w}, {n1:w}\n",
+            "ldrh   {prob:w}, [{step}, {sym}, lsl #1]\n",
+            normalize!(),
+            "lsr    {t:w}, {range:w}, #{total_bits}\n",
+            "add    {cnt:w}, {cnt:w}, {cnt:w}\n",
+            "sub    {u:w}, {prob:w}, #{offset}\n",
+            "mul    {t:w}, {t:w}, {prob:w}\n",
+            "subs   {v:w}, {code:w}, {t:w}\n",
+            "sub    {range:w}, {range:w}, {t:w}\n",
+            "csel   {n0:w}, {n1:w}, {n0:w}, hs\n",
+            "csel   {range:w}, {t:w}, {range:w}, lo\n",
+            "and    {n1:w}, {cnt:w}, {n0:w}\n",
+            "csel   {u:w}, {prob:w}, {u:w}, hs\n",
+            "csel   {code:w}, {v:w}, {code:w}, hs\n",
+            "sub    {u:w}, {prob:w}, {u:w}, asr #{move_bits}\n",
+            "strh   {u:w}, [{step}, {sym}, lsl #1]\n",
+            "add    {step}, {tab}, {n0}\n",
+            "adc    {sym:w}, {sym:w}, {sym:w}\n",
+        )
+    };
+}
+
+macro_rules! matched_last {
+    () => {
+        concat!(
+            "add    {step}, {step}, {n1}\n",
+            "ldrh   {prob:w}, [{step}, {sym}, lsl #1]\n",
+            normalize!(),
+            "lsr    {t:w}, {range:w}, #{total_bits}\n",
+            "sub    {u:w}, {prob:w}, #{offset}\n",
+            "mul    {t:w}, {t:w}, {prob:w}\n",
+            "subs   {v:w}, {code:w}, {t:w}\n",
+            "sub    {range:w}, {range:w}, {t:w}\n",
+            "csel   {range:w}, {t:w}, {range:w}, lo\n",
+            "csel   {u:w}, {prob:w}, {u:w}, hs\n",
+            "csel   {code:w}, {v:w}, {code:w}, hs\n",
+            "sub    {u:w}, {prob:w}, {u:w}, asr #{move_bits}\n",
+            "strh   {u:w}, [{step}, {sym}, lsl #1]\n",
+            "adc    {sym:w}, {sym:w}, {sym:w}\n",
+        )
+    };
+}
+
+/// What [`Coder::run`] stopped for.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum MatchKind {
-    /// A repeat match, at a distance used before.
-    Repeat,
-    /// A match with a distance decoded anew, to be checked against the
-    /// window's fill, and for the end marker.
-    Fresh,
-    /// A single byte at the last distance.
-    Short,
+enum Exit {
+    /// The output is full, or the input is down to its last bytes.
+    Limit,
+    /// A match the kernel does not copy itself: one that wraps the window
+    /// or runs past the output limit. `pending` and the first repeat
+    /// distance say what to copy.
+    Copy,
+    /// A distance reaches before the window's data.
+    Overflow,
+    /// The end of payload marker.
+    EndMarker,
+}
+
+/// The state the kernel loads at entry and stores at exit, in the order it
+/// reads it. Do not reorder.
+#[repr(C)]
+struct Run {
+    probs: *mut u16,
+    /// The input's base, its position, its last byte and the last position
+    /// a symbol may start at, as pointers.
+    buf: *const u8,
+    pos: *const u8,
+    last: *const u8,
+    stop: *const u8,
+    range: u64,
+    code: u64,
+    dic: *mut u8,
+    dic_pos: u64,
+    dic_limit: u64,
+    dic_full: u64,
+    dic_size: u64,
+    state: u64,
+    reps: [u64; 4],
+    previous: u64,
+    /// `lc` in the low byte, the position state mask shifted up by four in
+    /// the next, and the literal position mask shifted by `lc` in the high
+    /// half, so that one shift by the register and one and with it shifted
+    /// down give the literal coder.
+    masks: u64,
+    len: u64,
+    exit: u64,
+}
+
+const _: () = {
+    assert!(core::mem::offset_of!(Run, pos) == 16);
+    assert!(core::mem::offset_of!(Run, last) == 24);
+    assert!(core::mem::offset_of!(Run, stop) == 32);
+    assert!(core::mem::offset_of!(Run, range) == 40);
+    assert!(core::mem::offset_of!(Run, dic) == 56);
+    assert!(core::mem::offset_of!(Run, dic_limit) == 72);
+    assert!(core::mem::offset_of!(Run, dic_full) == 80);
+    assert!(core::mem::offset_of!(Run, dic_size) == 88);
+    assert!(core::mem::offset_of!(Run, state) == 96);
+    assert!(core::mem::offset_of!(Run, reps) == 104);
+    assert!(core::mem::offset_of!(Run, previous) == 136);
+    assert!(core::mem::offset_of!(Run, masks) == 144);
+    assert!(core::mem::offset_of!(Run, len) == 152);
+    assert!(core::mem::offset_of!(Run, exit) == 160);
+};
+
+/// The range coder over a buffer, for the kernel.
+struct Coder<'a> {
+    range: u32,
+    code: u32,
+    pos: usize,
+    buf: &'a [u8],
 }
 
 impl Coder<'_> {
-    unrolled_tree!(tree3, 3, [a, a]);
-    unrolled_tree!(tree6, 6, [a, a, a, a, a]);
-    unrolled_tree!(tree8, 8, [a, a, a, a, a, a, a]);
-
-    /// The four align bits of a distance, a reverse tree from node 1,
-    /// unrolled; returns the node reached, the value plus sixteen.
+    /// Whether a whole symbol, twenty bytes at most, is sure to be in the
+    /// buffer from `pos`.
     #[inline(always)]
-    fn align(&mut self, probs: &mut [u16]) -> u32 {
-        debug_assert_eq!(probs.len(), ALIGN_TABLE_SIZE);
-        let mut sym: u64 = 1;
-
-        // SAFETY: the nodes visited are 1, then one of 2 and 3, of 4 to 7, of
-        // 8 to 15, all inside the sixteen; the last step loads none. Every
-        // input read is clamped to the buffer's last byte. The assembly
-        // touches no stack and only the memory named.
-        unsafe {
-            core::arch::asm!(
-                reverse_step!("{probs}"),
-                reverse_step!("{probs}"),
-                reverse_step!("{probs}"),
-                reverse_last_step!("{probs}"),
-                range = inout(reg) self.range,
-                code = inout(reg) self.code,
-                pos = inout(reg) self.pos,
-                sym = inout(reg) sym,
-                step = inout(reg) 1u64 => _,
-                probs = in(reg) probs.as_mut_ptr(),
-                buf = in(reg) self.buf.as_ptr(),
-                last = in(reg) self.buf.len() - 1,
-                prob = inout(reg) u32::from(probs[1]) => _,
-                p0 = out(reg) _,
-                p1 = out(reg) _,
-                n0 = out(reg) _,
-                n1 = out(reg) _,
-                t = out(reg) _,
-                u = out(reg) _,
-                shift_bits = const SHIFT_BITS,
-                total_bits = const BIT_MODEL_TOTAL_BITS,
-                move_bits = const MOVE_BITS,
-                offset = const BIT_MODEL_OFFSET,
-                options(nostack),
-            );
-        }
-        sym as u32
+    fn has_symbol(&self) -> bool {
+        self.pos + IN_REQUIRED <= self.buf.len()
     }
 
-    /// Everything of a match after its is-match bit, as `LzmaDec.c` decodes
-    /// it, in one kernel: the is-rep bit and the repeat bits, the length,
-    /// the distance of a fresh match with its slot tree, special bits,
-    /// direct bits and align bits, the rotation of the repeat distances and
-    /// the state. `st.reps[0]` comes back as the distance plus one to copy
-    /// from, and `st.state` as the state after the match. The caller checks a
-    /// fresh distance against the window and for the end marker, and copies.
-    #[inline(always)]
-    fn decode_match_head(
-        &mut self,
-        probs: &mut [u16],
-        st: &mut Symbols,
-        pos_state: usize,
-    ) -> (u32, MatchKind) {
-        debug_assert!(probs.len() >= LITERAL);
-        let mut state = u64::from(st.state);
-        let [mut rep0, mut rep1, mut rep2, mut rep3] = st.reps.map(u64::from);
-        let len: u64;
-        let kind: u64;
+    /// Decodes symbols into the window until the output is full, the input
+    /// is down to its last bytes, a copy needs Rust, or the stream ends or
+    /// fails, and says which.
+    #[inline(never)]
+    fn run(&mut self, probs: &mut [u16], w: &mut WindowParts<'_>, st: &mut Symbols) -> Exit {
+        debug_assert!(probs.len() >= NUM_BASE_PROBS);
+        let (dic, dic_pos, dic_limit, dic_full, dic_size) = w.raw_parts();
+        let mut run = Run {
+            probs: probs.as_mut_ptr(),
+            buf: self.buf.as_ptr(),
+            pos: self.buf[self.pos..].as_ptr(),
+            last: self.buf[self.buf.len() - 1..].as_ptr(),
+            stop: self.buf[self.buf.len() - IN_REQUIRED..].as_ptr(),
+            range: u64::from(self.range),
+            code: u64::from(self.code),
+            dic,
+            dic_pos: dic_pos as u64,
+            dic_limit: dic_limit as u64,
+            dic_full: dic_full as u64,
+            dic_size: dic_size as u64,
+            state: u64::from(st.state),
+            reps: st.reps.map(u64::from),
+            previous: u64::from(st.previous),
+            masks: u64::from(st.lc)
+                | (u64::from(st.pb_mask) << (8 + NUM_POS_BITS_MAX))
+                | (u64::from(st.lp_mask) << (32 + st.lc)),
+            len: 0,
+            exit: 0,
+        };
 
-        // SAFETY: every probability read or written is one of the layout's:
-        // the is-rep tables at the state, the repeat-0-long table at the
-        // position state and state, a length coder's choice bits and its
-        // trees, the slot tree of the length state, the special positions
-        // below 128 and the sixteen align probabilities, all inside the
-        // array, whose length is at least `LITERAL`. Every input read is
-        // clamped to the buffer's last byte. The assembly touches no stack
-        // and only the memory named.
+        // SAFETY: the kernel reads and writes only `run`, the probabilities
+        // of the layout inside `probs` (whose length covers every literal
+        // coder the properties can address), the input buffer up to twenty
+        // bytes past a position it only starts a symbol at with twenty bytes
+        // left, and the window between the position and
+        // the limit, itself below the window's size, with every source byte
+        // read behind the position by a distance below the window's fill,
+        // which it checks, and a copy that would reach before the window's
+        // start or past its end left to Rust. The stack is used below the
+        // pointer and restored.
         unsafe {
             core::arch::asm!(
-                // The is-rep and repeat bits sit at the state.
+                // The state into registers.
+                "str    {p}, [sp, #-16]!",
+                "ldr    {probs}, [{p}]",
+                "ldr    {pos}, [{p}, #16]",
+                "ldp    {range}, {code}, [{p}, #40]",
+                "ldp    {dic}, {dpos}, [{p}, #56]",
+                "ldr    {dlim}, [{p}, #72]",
+                "ldr    {state}, [{p}, #96]",
+                "ldp    {rep0}, {rep1}, [{p}, #104]",
+                "ldp    {rep2}, {rep3}, [{p}, #120]",
+                "ldp    {prev}, {masks}, [{p}, #136]",
+                // ---- The first symbol's is-match table and probability;
+                // every later symbol has them ready from the one before. ----
+                next_is_match!("{dpos}"),
+                "ldrh   {prob:w}, [{step}, #{o_is_match}]",
+                ".p2align 6",
+                "10:",
+                "cmp    {dpos}, {dlim}",
+                "b.hs   90f",
+                "ldr    {t}, [{p}, #32]",
+                "cmp    {pos}, {t}",
+                "b.hi   90f",
+                // The is-match bit at the position state and the state.
+                branch_bit_loaded!("{step}", "{o_is_match}", "20"),
+                // ---- A literal: the coder of the last byte and the position. ----
+                "add    {tab}, {prev}, {dpos}, lsl #8",
+                "lsl    {tab}, {tab}, {masks}",
+                "and    {tab}, {tab}, {masks}, lsr #32",
+                "add    {tab}, {tab}, {tab}, lsl #1",
+                "add    {tab}, {probs}, {tab}, lsl #1",
+                "add    {tab}, {tab}, #{o_literal}",
+                "cmp    {state:w}, #7",
+                "b.hs   12f",
+                // A plain literal; the state falls back towards 0.
+                "cmp    {state:w}, #4",
+                "sub    {t:w}, {state:w}, #3",
+                "csel   {state:w}, wzr, {t:w}, lo",
+                "add    {n0}, {dpos}, #1",
+                next_is_match!("{n0}"),
+                tree8!("{tab}"),
+                "13:",
+                // The byte, which is the next literal's context.
+                "strb   {sym:w}, [{dic}, {dpos}]",
+                "add    {dpos}, {dpos}, #1",
+                "and    {prev:w}, {sym:w}, #0xFF",
+                "ldrh   {prob:w}, [{step}, #{o_is_match}]",
+                "b      10b",
+                "12:",
+                // A literal against the byte at the last distance, which may
+                // lie before the window's start and wrap.
+                "cmp    {state:w}, #10",
+                "sub    {t:w}, {state:w}, #3",
+                "sub    {u:w}, {state:w}, #6",
+                "csel   {state:w}, {t:w}, {u:w}, lo",
+                "sub    {t}, {dpos}, {rep0}",
+                "ldr    {u}, [{p}, #88]",
+                "add    {u}, {t}, {u}",
+                "cmp    {dpos}, {rep0}",
+                "csel   {t}, {u}, {t}, lo",
+                "ldrb   {cnt:w}, [{dic}, {t}]",
+                matched_first!(),
+                matched_step!(),
+                matched_step!(),
+                matched_step!(),
+                matched_step!(),
+                matched_step!(),
+                matched_step!(),
+                matched_last!(),
+                "add    {n0}, {dpos}, #1",
+                next_is_match!("{n0}"),
+                "b      13b",
+                // ---- A match: the is-rep and repeat bits sit at the state. ----
+                "20:",
+                branch_bit_one!("{step}", "{o_is_match}"),
+                "ubfx   {t}, {masks}, #8, #8",
+                "and    {n0}, {t}, {dpos}, lsl #{pos_bits}",
                 "add    {tab}, {probs}, {state}, lsl #1",
-                branch_bit!("{tab}", "{o_is_rep}", "10"),
+                branch_bit!("{tab}", "{o_is_rep}", "30"),
                 // A fresh match: the state moves up, the length coder is the
                 // match one.
                 "add    {state}, {state}, #12",
                 "add    {tab}, {probs}, #{o_len_coder}",
-                "mov    {kind:w}, #1",
-                "b      14f",
-                "10:",
+                "b      40f",
+                "30:",
                 branch_bit_one!("{tab}", "{o_is_rep}"),
-                branch_bit!("{tab}", "{o_is_rep_g0}", "11"),
+                branch_bit!("{tab}", "{o_is_rep_g0}", "31"),
                 // The last distance again: one byte, or a length.
-                "add    {n0}, {tab}, {ps}, lsl #1",
-                branch_bit!("{n0}", "{o_is_rep0_long}", "12"),
+                "add    {n1}, {tab}, {n0}, lsl #1",
+                branch_bit!("{n1}", "{o_is_rep0_long}", "32"),
                 "cmp    {state:w}, #7",
-                "mov    {len:w}, #1",
-                "mov    {kind:w}, #2",
                 "mov    {t:w}, #9",
                 "mov    {u:w}, #11",
                 "csel   {state:w}, {t:w}, {u:w}, lo",
-                "b      31f",
-                "12:",
-                branch_bit_one!("{n0}", "{o_is_rep0_long}"),
-                "b      13f",
-                "11:",
+                "mov    {cnt:w}, #1",
+                "b      50f",
+                "32:",
+                branch_bit_one!("{n1}", "{o_is_rep0_long}"),
+                "b      33f",
+                "31:",
                 branch_bit_one!("{tab}", "{o_is_rep_g0}"),
-                branch_bit!("{tab}", "{o_is_rep_g1}", "15"),
+                branch_bit!("{tab}", "{o_is_rep_g1}", "35"),
                 // The second distance, moved to the front.
-                "mov    {dist:w}, {rep1:w}",
+                "mov    {tab:w}, {rep1:w}",
                 "mov    {rep1:w}, {rep0:w}",
-                "mov    {rep0:w}, {dist:w}",
-                "b      13f",
-                "15:",
+                "mov    {rep0:w}, {tab:w}",
+                "b      33f",
+                "35:",
                 branch_bit_one!("{tab}", "{o_is_rep_g1}"),
-                branch_bit!("{tab}", "{o_is_rep_g2}", "16"),
+                branch_bit!("{tab}", "{o_is_rep_g2}", "36"),
                 // The third distance.
-                "mov    {dist:w}, {rep2:w}",
-                "b      17f",
-                "16:",
+                "mov    {tab:w}, {rep2:w}",
+                "b      37f",
+                "36:",
                 branch_bit_one!("{tab}", "{o_is_rep_g2}"),
                 // The fourth.
-                "mov    {dist:w}, {rep3:w}",
+                "mov    {tab:w}, {rep3:w}",
                 "mov    {rep3:w}, {rep2:w}",
-                "17:",
+                "37:",
                 "mov    {rep2:w}, {rep1:w}",
                 "mov    {rep1:w}, {rep0:w}",
-                "mov    {rep0:w}, {dist:w}",
-                "13:",
+                "mov    {rep0:w}, {tab:w}",
+                "33:",
                 // A repeat match with a length: the state, the repeat length
                 // coder.
                 "cmp    {state:w}, #7",
@@ -553,81 +711,59 @@ impl Coder<'_> {
                 "mov    {u:w}, #11",
                 "csel   {state:w}, {t:w}, {u:w}, lo",
                 "add    {tab}, {probs}, #{o_rep_len_coder}",
-                "mov    {kind:w}, #0",
-                "14:",
-                // The length: the two choice bits at the head of the coder,
-                // the low and mid trees at the position state, the high tree.
-                branch_bit!("{tab}", "0", "18"),
-                "add    {n1}, {tab}, {ps}, lsl #1",
-                "mov    {sym:w}, #1",
-                "ldrh   {prob:w}, [{n1}, #2]",
-                tree_step!("{n1}"),
-                tree_step!("{n1}"),
-                tree_last_step!("{n1}"),
-                "sub    {len:w}, {sym:w}, #8",
-                "b      19f",
-                "18:",
+                "40:",
+                // ---- The length in bytes: two choice bits, then the low or
+                // mid tree at the position state or the high tree. ----
+                branch_bit!("{tab}", "0", "41"),
+                "add    {n1}, {tab}, {n0}, lsl #1",
+                tree3!("{n1}"),
+                "sub    {cnt:w}, {sym:w}, #6",
+                "b      45f",
+                "41:",
                 branch_bit_one!("{tab}", "0"),
-                branch_bit!("{tab}", "16", "20"),
-                "add    {n1}, {tab}, {ps}, lsl #1",
+                branch_bit!("{tab}", "16", "42"),
+                "add    {n1}, {tab}, {n0}, lsl #1",
                 "add    {n1}, {n1}, #16",
-                "mov    {sym:w}, #1",
-                "ldrh   {prob:w}, [{n1}, #2]",
-                tree_step!("{n1}"),
-                tree_step!("{n1}"),
-                tree_last_step!("{n1}"),
-                "mov    {len:w}, {sym:w}",
-                "b      19f",
-                "20:",
+                tree3!("{n1}"),
+                "add    {cnt:w}, {sym:w}, #2",
+                "b      45f",
+                "42:",
                 branch_bit_one!("{tab}", "16"),
                 "add    {n1}, {tab}, #512",
-                "mov    {sym:w}, #1",
-                "ldrh   {prob:w}, [{n1}, #2]",
-                tree_step!("{n1}"),
-                tree_step!("{n1}"),
-                tree_step!("{n1}"),
-                tree_step!("{n1}"),
-                tree_step!("{n1}"),
-                tree_step!("{n1}"),
-                tree_step!("{n1}"),
-                tree_last_step!("{n1}"),
-                "sub    {len:w}, {sym:w}, #240",
-                "19:",
-                // A repeat match is done but for the length's base.
-                "cmp    {kind:w}, #1",
-                "b.ne   30f",
-                // A fresh distance: the slot tree of the length state.
-                "cmp    {len:w}, #3",
-                "mov    {t:w}, #3",
-                "csel   {t:w}, {len:w}, {t:w}, lo",
+                tree8!("{n1}"),
+                "sub    {cnt:w}, {sym:w}, #238",
+                "45:",
+                // A repeat match copies now.
+                "cmp    {state:w}, #12",
+                "b.lo   50f",
+                // ---- A fresh distance: the slot tree of the length state.
+                // The length waits in the state block meanwhile. ----
+                "str    {cnt}, [{p}, #152]",
+                "sub    {t:w}, {cnt:w}, #2",
+                "cmp    {t:w}, #3",
+                "mov    {u:w}, #3",
+                "csel   {t:w}, {t:w}, {u:w}, lo",
                 "add    {n1}, {probs}, #{o_pos_slot}",
                 "add    {n1}, {n1}, {t}, lsl #7",
-                "mov    {sym:w}, #1",
-                "ldrh   {prob:w}, [{n1}, #2]",
-                tree_step!("{n1}"),
-                tree_step!("{n1}"),
-                tree_step!("{n1}"),
-                tree_step!("{n1}"),
-                tree_step!("{n1}"),
-                tree_last_step!("{n1}"),
+                tree6!("{n1}"),
                 "sub    {sym:w}, {sym:w}, #64",
                 "cmp    {sym:w}, #4",
-                "b.lo   21f",
+                "b.lo   48f",
                 // The slot's direct bits: how many, and the two bits on top.
                 "lsr    {cnt:w}, {sym:w}, #1",
                 "sub    {cnt:w}, {cnt:w}, #1",
-                "and    {dist:w}, {sym:w}, #1",
-                "orr    {dist:w}, {dist:w}, #2",
+                "and    {tab:w}, {sym:w}, #1",
+                "orr    {tab:w}, {tab:w}, #2",
                 "cmp    {sym:w}, #14",
-                "b.hs   22f",
+                "b.hs   46f",
                 // The special positions: a reverse tree from the distance
                 // plus one, with a step that doubles, walked as many bits as
                 // the slot has, the children loaded ahead but for the last.
-                "lsl    {dist:w}, {dist:w}, {cnt:w}",
-                "add    {sym:w}, {dist:w}, #1",
+                "lsl    {tab:w}, {tab:w}, {cnt:w}",
+                "add    {sym:w}, {tab:w}, #1",
                 "mov    {step:w}, #1",
                 "ldrh   {prob:w}, [{probs}, {sym}, lsl #1]",
-                "23:",
+                "47:",
                 normalize!(),
                 "subs   {cnt:w}, {cnt:w}, #1",
                 "add    {n0}, {sym}, {step}",
@@ -641,81 +777,185 @@ impl Coder<'_> {
                 "strh   {u:w}, [{probs}, {sym}, lsl #1]",
                 "csel   {sym}, {n1}, {n0}, hs",
                 "csel   {prob:w}, {p1:w}, {p0:w}, hs",
-                "cbnz   {cnt:w}, 23b",
-                "sub    {dist:w}, {sym:w}, {step:w}",
-                "b      24f",
-                "22:",
+                "cbnz   {cnt:w}, 47b",
+                "sub    {tab:w}, {sym:w}, {step:w}",
+                "b      49f",
+                "46:",
                 // The direct bits, then the four align bits, a reverse tree
                 // from node 1.
                 "sub    {cnt:w}, {cnt:w}, #4",
-                "25:",
+                "44:",
                 normalize!(),
-                "lsl    {dist:w}, {dist:w}, #1",
-                "orr    {t:w}, {dist:w}, #1",
+                "lsl    {tab:w}, {tab:w}, #1",
+                "orr    {t:w}, {tab:w}, #1",
                 "lsr    {range:w}, {range:w}, #1",
                 "subs   {u:w}, {code:w}, {range:w}",
                 "csel   {code:w}, {u:w}, {code:w}, hs",
-                "csel   {dist:w}, {t:w}, {dist:w}, hs",
+                "csel   {tab:w}, {t:w}, {tab:w}, hs",
                 "subs   {cnt:w}, {cnt:w}, #1",
-                "b.ne   25b",
-                "lsl    {dist:w}, {dist:w}, #4",
-                "add    {tab}, {probs}, #{o_align}",
+                "b.ne   44b",
+                "lsl    {tab:w}, {tab:w}, #4",
+                "add    {cnt}, {probs}, #{o_align}",
                 "mov    {sym:w}, #1",
                 "mov    {step:w}, #1",
-                "ldrh   {prob:w}, [{tab}, #2]",
-                reverse_step!("{tab}"),
-                reverse_step!("{tab}"),
-                reverse_step!("{tab}"),
-                reverse_last_step!("{tab}"),
+                "ldrh   {prob:w}, [{cnt}, #2]",
+                reverse_step!("{cnt}"),
+                reverse_step!("{cnt}"),
+                reverse_step!("{cnt}"),
+                reverse_last_step!("{cnt}"),
                 "sub    {t:w}, {sym:w}, #16",
-                "orr    {dist:w}, {dist:w}, {t:w}",
-                "b      24f",
-                "21:",
-                "mov    {dist:w}, {sym:w}",
-                "24:",
-                // The distances rotate, the state settles.
+                "orr    {tab:w}, {tab:w}, {t:w}",
+                "b      49f",
+                "48:",
+                "mov    {tab:w}, {sym:w}",
+                "49:",
+                // The distances rotate, the state settles, the length comes
+                // back, and the distance is checked for the end marker and
+                // against the window's fill, which is the position until the
+                // window first wraps.
                 "mov    {rep3:w}, {rep2:w}",
                 "mov    {rep2:w}, {rep1:w}",
                 "mov    {rep1:w}, {rep0:w}",
-                "add    {rep0:w}, {dist:w}, #1",
+                "add    {rep0:w}, {tab:w}, #1",
                 "cmp    {state:w}, #19",
                 "mov    {t:w}, #7",
                 "mov    {u:w}, #10",
                 "csel   {state:w}, {t:w}, {u:w}, lo",
-                "30:",
-                // A length is the decoded value plus the shortest match.
-                "add    {len:w}, {len:w}, #2",
-                "31:",
-                range = inout(reg) self.range,
-                code = inout(reg) self.code,
-                pos = inout(reg) self.pos,
-                state = inout(reg) state,
-                rep0 = inout(reg) rep0,
-                rep1 = inout(reg) rep1,
-                rep2 = inout(reg) rep2,
-                rep3 = inout(reg) rep3,
-                len = out(reg) len,
-                kind = out(reg) kind,
-                ps = in(reg) (pos_state << NUM_POS_BITS_MAX) as u64,
-                probs = in(reg) probs.as_mut_ptr(),
-                buf = in(reg) self.buf.as_ptr(),
-                last = in(reg) self.buf.len() - 1,
+                "ldr    {cnt}, [{p}, #152]",
+                "cbz    {rep0:w}, 93f",
+                "ldr    {t}, [{p}, #80]",
+                "cmp    {t}, {dpos}",
+                "csel   {t}, {t}, {dpos}, hi",
+                "cmp    {tab}, {t}",
+                "b.hs   92f",
+                // ---- The copy of `cnt` bytes from `rep0` back. ----
+                "50:",
+                // A source before the window's start, or a copy past the
+                // limit, is Rust's.
+                "cmp    {rep0}, {dpos}",
+                "b.hi   91f",
+                "add    {t}, {dpos}, {cnt}",
+                "cmp    {t}, {dlim}",
+                "b.hi   91f",
+                "sub    {n0}, {dpos}, {rep0}",
+                "add    {n0}, {dic}, {n0}",
+                "add    {n1}, {dic}, {dpos}",
+                "mov    {dpos}, {t}",
+                "cmp    {rep0}, #16",
+                "b.lo   55f",
+                "cmp    {cnt}, #16",
+                "b.lo   53f",
+                // Sixteen bytes at a time, the last sixteen overlapping the
+                // ones before, so that exactly the match is written. Every
+                // double word read lies a whole one behind the write position.
+                "sub    {t}, {cnt}, #16",
+                "add    {step}, {n0}, {t}",
+                "add    {sym}, {n1}, {t}",
+                "51:",
+                "ldr    {q:q}, [{n0}], #16",
+                "subs   {t}, {t}, #16",
+                "str    {q:q}, [{n1}], #16",
+                "b.hs   51b",
+                "ldr    {q:q}, [{step}]",
+                "str    {q:q}, [{sym}]",
+                "b      59f",
+                "53:",
+                // Fewer than sixteen: a word, then a masked word with the
+                // destination's own bytes past the match kept, when the
+                // window has that word of room.
+                "cmp    {cnt}, #8",
+                "b.lo   54f",
+                "ldr    {t}, [{n0}], #8",
+                "str    {t}, [{n1}], #8",
+                "subs   {cnt}, {cnt}, #8",
+                "b.eq   59f",
+                "54:",
+                "ldr    {step}, [{p}, #88]",
+                "add    {sym}, {dpos}, #8",
+                "cmp    {sym}, {step}",
+                "b.hi   55f",
+                "ldr    {t}, [{n0}]",
+                "ldr    {u}, [{n1}]",
+                "lsl    {step}, {cnt}, #3",
+                "mov    {sym}, #-1",
+                "lsl    {sym}, {sym}, {step}",
+                "and    {u}, {u}, {sym}",
+                "bic    {t}, {t}, {sym}",
+                "orr    {t}, {t}, {u}",
+                "str    {t}, [{n1}]",
+                "b      59f",
+                "55:",
+                // A source within sixteen bytes of the destination, or a copy
+                // at the window's end: a byte at a time, as the source may be
+                // the pattern that repeats.
+                "ldrb   {t:w}, [{n0}], #1",
+                "strb   {t:w}, [{n1}], #1",
+                "subs   {cnt}, {cnt}, #1",
+                "b.ne   55b",
+                "59:",
+                "sub    {t}, {dpos}, #1",
+                "ldrb   {prev:w}, [{dic}, {t}]",
+                next_is_match!("{dpos}"),
+                "ldrh   {prob:w}, [{step}, #{o_is_match}]",
+                "b      10b",
+                // ---- Exits: the state back into memory, and why. ----
+                "91:",
+                "mov    {sym:w}, #1",
+                "b      95f",
+                "92:",
+                "mov    {sym:w}, #2",
+                "b      95f",
+                "93:",
+                "mov    {sym:w}, #3",
+                "b      95f",
+                "90:",
+                "mov    {sym:w}, #0",
+                "95:",
+                "ldr    {p}, [sp], #16",
+                "str    {pos}, [{p}, #16]",
+                "stp    {range}, {code}, [{p}, #40]",
+                "str    {dpos}, [{p}, #64]",
+                "str    {state}, [{p}, #96]",
+                "stp    {rep0}, {rep1}, [{p}, #104]",
+                "stp    {rep2}, {rep3}, [{p}, #120]",
+                "str    {prev}, [{p}, #136]",
+                "stp    {cnt}, {sym}, [{p}, #152]",
+                p = inout(reg) &mut run as *mut Run => _,
+                probs = out(reg) _,
+                pos = out(reg) _,
+                dlim = out(reg) _,
+                range = out(reg) _,
+                code = out(reg) _,
+                dic = out(reg) _,
+                dpos = out(reg) _,
+                masks = out(reg) _,
+                state = out(reg) _,
+                rep0 = out(reg) _,
+                rep1 = out(reg) _,
+                rep2 = out(reg) _,
+                rep3 = out(reg) _,
+                prev = out(reg) _,
                 prob = out(reg) _,
                 p0 = out(reg) _,
                 p1 = out(reg) _,
                 sym = out(reg) _,
-                dist = out(reg) _,
                 cnt = out(reg) _,
                 step = out(reg) _,
                 n0 = out(reg) _,
                 n1 = out(reg) _,
                 tab = out(reg) _,
+                tab2 = out(reg) _,
                 t = out(reg) _,
                 u = out(reg) _,
+                v = out(reg) _,
+                q = out(vreg) _,
                 shift_bits = const SHIFT_BITS,
                 total_bits = const BIT_MODEL_TOTAL_BITS,
                 move_bits = const MOVE_BITS,
                 offset = const BIT_MODEL_OFFSET,
+                pos_bits = const NUM_POS_BITS_MAX,
+                o_is_match = const IS_MATCH * 2,
+                o_literal = const LITERAL * 2,
                 o_is_rep = const IS_REP * 2,
                 o_is_rep_g0 = const IS_REP_G0 * 2,
                 o_is_rep_g1 = const IS_REP_G1 * 2,
@@ -725,280 +965,26 @@ impl Coder<'_> {
                 o_rep_len_coder = const REP_LEN_CODER * 2,
                 o_pos_slot = const POS_SLOT * 2,
                 o_align = const ALIGN * 2,
-                options(nostack),
             );
         }
-        st.state = state as u32;
-        st.reps = [rep0 as u32, rep1 as u32, rep2 as u32, rep3 as u32];
-        let kind = match kind {
-            0 => MatchKind::Repeat,
-            1 => MatchKind::Fresh,
-            _ => MatchKind::Short,
-        };
-        (len as u32, kind)
-    }
-}
 
-impl Bits for Coder<'_> {
-    #[inline(always)]
-    fn literal(&mut self, probs: &mut [u16]) -> u32 {
-        self.tree8(probs)
-    }
-
-    /// A single bit, the ones the decoder branches on, in Rust: the same
-    /// arithmetic as [`RangeDecoder::decode_bit`], with the input read
-    /// clamped as in the kernels.
-    #[inline(always)]
-    fn bit(&mut self, prob: &mut u16) -> u32 {
-        if self.range < TOP_VALUE {
-            let b = u32::from(self.buf[self.pos.min(self.buf.len() - 1)]);
-            self.pos += 1;
-            self.code = (self.code << SHIFT_BITS) | b;
-            self.range <<= SHIFT_BITS;
+        // SAFETY: the kernel moves the position within the buffer and to at
+        // most one past its last byte.
+        self.pos = unsafe { run.pos.offset_from(run.buf) } as usize;
+        self.range = run.range as u32;
+        self.code = run.code as u32;
+        w.set_pos(run.dic_pos as usize);
+        st.state = run.state as u32;
+        st.reps = run.reps.map(|r| r as u32);
+        st.previous = run.previous as u32;
+        st.pending = run.len as u32;
+        match run.exit {
+            0 => Exit::Limit,
+            1 => Exit::Copy,
+            2 => Exit::Overflow,
+            _ => Exit::EndMarker,
         }
-        let p = u32::from(*prob);
-        let bound = (self.range >> BIT_MODEL_TOTAL_BITS) * p;
-        // 0 for a 0, all ones for a 1.
-        let mask = 0u32.wrapping_sub(u32::from(self.code >= bound));
-        self.range = (bound & !mask) | ((self.range - bound) & mask);
-        self.code -= bound & mask;
-        let offset = BIT_MODEL_OFFSET & !mask;
-        *prob = p.wrapping_sub(p.wrapping_sub(offset) >> MOVE_BITS) as u16;
-        mask & 1
     }
-
-    #[inline(always)]
-    fn tree(&mut self, probs: &mut [u16]) -> u32 {
-        debug_assert!(probs.len() >= 2 && probs.len().is_power_of_two());
-        // The sizes the format has, unrolled; the length is a constant at
-        // every call, so this is no branch.
-        match probs.len() {
-            8 => return self.tree3(probs),
-            64 => return self.tree6(probs),
-            256 => return self.tree8(probs),
-            _ => {}
-        }
-        let count = probs.len().trailing_zeros();
-        let mut sym: u64 = 1;
-
-        // SAFETY: the node visited at each step is `sym`, below the number of
-        // leaves, and the children loaded ahead are `2 * sym` and `2 * sym +
-        // 1`, below it too except on the last step, which loads indices 0 and
-        // 1 instead. Every input read is clamped to the buffer's last byte.
-        // The assembly touches no stack and only the memory named.
-        unsafe {
-            core::arch::asm!(
-                "2:",
-                normalize!(),
-                // The children of this node, before the bit is known; the
-                // last step has none and reads the unused first pair instead.
-                "subs   {count:w}, {count:w}, #1",
-                "add    {t}, {probs}, {sym}, lsl #2",
-                "csel   {t}, {probs}, {t}, eq",
-                "ldrh   {p0:w}, [{t}]",
-                "ldrh   {p1:w}, [{t}, #2]",
-                decide!(),
-                "strh   {u:w}, [{probs}, {sym}, lsl #1]",
-                // Down to the child the bit chose: the carry is the bit.
-                "csel   {prob:w}, {p1:w}, {p0:w}, hs",
-                "adc    {sym:w}, {sym:w}, {sym:w}",
-                "cbnz   {count:w}, 2b",
-                range = inout(reg) self.range,
-                code = inout(reg) self.code,
-                pos = inout(reg) self.pos,
-                sym = inout(reg) sym,
-                count = inout(reg) count => _,
-                probs = in(reg) probs.as_mut_ptr(),
-                buf = in(reg) self.buf.as_ptr(),
-                last = in(reg) self.buf.len() - 1,
-                prob = inout(reg) u32::from(probs[1]) => _,
-                p0 = out(reg) _,
-                p1 = out(reg) _,
-                t = out(reg) _,
-                u = out(reg) _,
-                shift_bits = const SHIFT_BITS,
-                total_bits = const BIT_MODEL_TOTAL_BITS,
-                move_bits = const MOVE_BITS,
-                offset = const BIT_MODEL_OFFSET,
-                options(nostack),
-            );
-        }
-        sym as u32 - probs.len() as u32
-    }
-
-    #[inline(always)]
-    fn matched_literal(&mut self, probs: &mut [u16], match_byte: u32) -> u32 {
-        debug_assert_eq!(probs.len(), LIT_SIZE);
-        let mut sym: u64 = 1;
-
-        // SAFETY: the index is `offs + bit + sym` with `offs` and `bit` each 0
-        // or 0x100 and `sym` below 0x100, so below 0x300. Every input read is
-        // clamped to the buffer's last byte. The assembly touches no stack and
-        // only the memory named.
-        unsafe {
-            core::arch::asm!(
-                "2:",
-                normalize!(),
-                // The match byte's next bit picks the coder: the index is offs
-                // + bit + sym, where bit is the offset so far and offs keeps it
-                // only while the match byte's bit is set.
-                "lsl    {mb:w}, {mb:w}, #1",
-                "mov    {bit:w}, {offs:w}",
-                "and    {offs:w}, {offs:w}, {mb:w}",
-                "add    {idx:w}, {offs:w}, {bit:w}",
-                "add    {idx:w}, {idx:w}, {sym:w}",
-                "ldrh   {prob:w}, [{probs}, {idx}, lsl #1]",
-                decide!(),
-                "strh   {u:w}, [{probs}, {idx}, lsl #1]",
-                // A decoded 0 that disagrees with the match byte drops the
-                // offset: offs ^= bit.
-                "eor    {t:w}, {offs:w}, {bit:w}",
-                "csel   {offs:w}, {offs:w}, {t:w}, hs",
-                "adc    {sym:w}, {sym:w}, {sym:w}",
-                "subs   {count:w}, {count:w}, #1",
-                "b.ne   2b",
-                range = inout(reg) self.range,
-                code = inout(reg) self.code,
-                pos = inout(reg) self.pos,
-                sym = inout(reg) sym,
-                offs = inout(reg) 0x100u64 => _,
-                mb = inout(reg) match_byte => _,
-                count = inout(reg) 8u32 => _,
-                probs = in(reg) probs.as_mut_ptr(),
-                buf = in(reg) self.buf.as_ptr(),
-                last = in(reg) self.buf.len() - 1,
-                prob = out(reg) _,
-                bit = out(reg) _,
-                idx = out(reg) _,
-                t = out(reg) _,
-                u = out(reg) _,
-                shift_bits = const SHIFT_BITS,
-                total_bits = const BIT_MODEL_TOTAL_BITS,
-                move_bits = const MOVE_BITS,
-                offset = const BIT_MODEL_OFFSET,
-                options(nostack),
-            );
-        }
-        sym as u32 - 0x100
-    }
-
-    #[inline(always)]
-    fn reverse(&mut self, probs: &mut [u16], start: u32, count: u32) -> u32 {
-        debug_assert!(count >= 1 && probs.len() >= 2);
-        if probs.len() == ALIGN_TABLE_SIZE && start == 1 && count == NUM_ALIGN_BITS {
-            return self.align(probs);
-        }
-        let mut sym: u64 = u64::from(start);
-
-        // SAFETY: the caller keeps every node visited inside `probs`; the two
-        // children loaded ahead are the nodes the next step would visit, and
-        // the last step loads index 0 instead. Every input read is clamped to
-        // the buffer's last byte. The assembly touches no stack and only the
-        // memory named.
-        unsafe {
-            core::arch::asm!(
-                "2:",
-                normalize!(),
-                // The nodes a 0 and a 1 lead to, and their probabilities,
-                // before the bit is known.
-                "subs   {count:w}, {count:w}, #1",
-                "add    {n0}, {sym}, {step}",
-                "add    {step}, {step}, {step}",
-                "add    {n1}, {sym}, {step}",
-                "csel   {t}, xzr, {n0}, eq",
-                "ldrh   {p0:w}, [{probs}, {t}, lsl #1]",
-                "csel   {t}, xzr, {n1}, eq",
-                "ldrh   {p1:w}, [{probs}, {t}, lsl #1]",
-                decide!(),
-                "strh   {u:w}, [{probs}, {sym}, lsl #1]",
-                "csel   {sym}, {n1}, {n0}, hs",
-                "csel   {prob:w}, {p1:w}, {p0:w}, hs",
-                "cbnz   {count:w}, 2b",
-                range = inout(reg) self.range,
-                code = inout(reg) self.code,
-                pos = inout(reg) self.pos,
-                sym = inout(reg) sym,
-                step = inout(reg) 1u64 => _,
-                count = inout(reg) count => _,
-                probs = in(reg) probs.as_mut_ptr(),
-                buf = in(reg) self.buf.as_ptr(),
-                last = in(reg) self.buf.len() - 1,
-                prob = inout(reg) u32::from(probs[start as usize]) => _,
-                p0 = out(reg) _,
-                p1 = out(reg) _,
-                n0 = out(reg) _,
-                n1 = out(reg) _,
-                t = out(reg) _,
-                u = out(reg) _,
-                shift_bits = const SHIFT_BITS,
-                total_bits = const BIT_MODEL_TOTAL_BITS,
-                move_bits = const MOVE_BITS,
-                offset = const BIT_MODEL_OFFSET,
-                options(nostack),
-            );
-        }
-        sym as u32
-    }
-
-    #[inline(always)]
-    fn direct_bits(&mut self, count: u32) -> u32 {
-        let mut result: u32 = 0;
-
-        // SAFETY: every input read is clamped to the buffer's last byte, and
-        // the assembly touches no memory else and no stack.
-        unsafe {
-            core::arch::asm!(
-                "2:",
-                normalize!(),
-                // Halve the range; the bit is 1 when the code is at or past it.
-                "lsl    {result:w}, {result:w}, #1",
-                "orr    {one:w}, {result:w}, #1",
-                "lsr    {range:w}, {range:w}, #1",
-                "subs   {u:w}, {code:w}, {range:w}",
-                "csel   {code:w}, {u:w}, {code:w}, hs",
-                "csel   {result:w}, {one:w}, {result:w}, hs",
-                "subs   {count:w}, {count:w}, #1",
-                "b.ne   2b",
-                range = inout(reg) self.range,
-                code = inout(reg) self.code,
-                pos = inout(reg) self.pos,
-                result = inout(reg) result,
-                count = inout(reg) count => _,
-                buf = in(reg) self.buf.as_ptr(),
-                last = in(reg) self.buf.len() - 1,
-                one = out(reg) _,
-                t = out(reg) _,
-                u = out(reg) _,
-                shift_bits = const SHIFT_BITS,
-                options(nostack, readonly),
-            );
-        }
-        result
-    }
-
-    #[inline(always)]
-    fn match_head(
-        &mut self,
-        probs: &mut [u16],
-        st: &mut Symbols,
-        pos_state: usize,
-    ) -> Option<(u32, MatchKind)> {
-        Some(self.decode_match_head(probs, st, pos_state))
-    }
-}
-
-/// The state of a run of symbols, in locals: the state as 7-Zip counts it
-/// (0 to 11), the repeat distances as 7-Zip keeps them (the distance plus
-/// one), and the masks of the properties.
-struct Symbols {
-    state: u32,
-    reps: [u32; 4],
-    /// The last byte of the output, the literal context; 0 before the first.
-    previous: u32,
-    lc: u32,
-    lp_mask: u32,
-    pb_mask: u32,
-    end_marker: bool,
 }
 
 /// The decoder: the probabilities in 7-Zip's one array, the state as 7-Zip
@@ -1053,8 +1039,8 @@ impl LzmaDecoder {
         if self.end_marker {
             return Err(error_other("dist overflow"));
         }
-        // The state of the run in locals, where the kernels leave it in
-        // registers; the decoder and the window take it back at the end.
+        // The state of the run in locals; the decoder and the window take it
+        // back at the end.
         let mut w = lz.parts();
         let mut st = Symbols {
             state: self.state,
@@ -1068,12 +1054,13 @@ impl LzmaDecoder {
             lp_mask: (0x100u32 << self.lp) - (0x100u32 >> self.lc),
             pb_mask: (1u32 << self.pb) - 1,
             end_marker: false,
+            pending: 0,
         };
         let probs = &mut self.probs[..];
         let mut result = Ok(());
         if rc.inner().is_buffer() {
             // The symbols a whole one of which is sure to be in the buffer,
-            // through the kernels; the last few bytes are left to the loop
+            // through the kernel; the last few bytes are left to the loop
             // below.
             let state = rc.state();
             let mut coder = Coder {
@@ -1083,9 +1070,25 @@ impl LzmaDecoder {
                 buf: rc.inner().buf(),
             };
             while w.has_space() && coder.has_symbol() {
-                if let Err(error) = Self::decode_symbol(probs, &mut w, &mut st, &mut coder) {
-                    result = Err(error);
-                    break;
+                match coder.run(probs, &mut w, &mut st) {
+                    Exit::Limit => break,
+                    Exit::Copy => {
+                        if let Err(error) = w.repeat((st.reps[0] - 1) as usize, st.pending as usize)
+                        {
+                            result = Err(error);
+                            break;
+                        }
+                        st.previous = u32::from(w.get_byte(0));
+                    }
+                    Exit::Overflow => {
+                        result = Err(error_other("dist overflow"));
+                        break;
+                    }
+                    Exit::EndMarker => {
+                        st.end_marker = true;
+                        result = Err(error_other("dist overflow"));
+                        break;
+                    }
                 }
             }
             let (range, code, pos) = (coder.range, coder.code, coder.pos);
@@ -1116,61 +1119,99 @@ impl LzmaDecoder {
         Ok(())
     }
 
-    /// One LZMA symbol, as 7-Zip's `LzmaDec_DecodeReal` decodes it, into
-    /// the window.
+    /// A bit tree of `probs.len()` leaves, a power of two; the leaf. Index 0
+    /// is not used.
     #[inline(always)]
-    fn decode_symbol<B: Bits>(
+    fn tree<R: RangeReader>(rc: &mut RangeDecoder<R>, probs: &mut [u16]) -> u32 {
+        let limit = probs.len();
+        let mut i = 1usize;
+        while i < limit {
+            // The mask is a no-op on the index and lets the bounds check go.
+            i = (i << 1) | rc.decode_bit(&mut probs[i & (limit - 1)]) as usize;
+        }
+        (i - limit) as u32
+    }
+
+    /// A literal against `match_byte`, over the 0x300 probabilities of one
+    /// literal coder, the way `LzmaDec.c` indexes them.
+    #[inline(always)]
+    fn matched_literal<R: RangeReader>(
+        rc: &mut RangeDecoder<R>,
+        probs: &mut [u16],
+        match_byte: u32,
+    ) -> u32 {
+        let mut match_byte = match_byte;
+        let mut offs = 0x100u32;
+        let mut symbol = 1u32;
+        while symbol < 0x100 {
+            match_byte += match_byte;
+            let bit = offs;
+            offs &= match_byte;
+            let decoded = rc.decode_bit(&mut probs[(offs + bit + symbol) as usize]) as u32;
+            symbol = (symbol << 1) | decoded;
+            if decoded == 0 {
+                offs ^= bit;
+            }
+        }
+        symbol - 0x100
+    }
+
+    /// `count` bits of a reverse bit tree from node `start`, walked as 7-Zip's
+    /// `REV_BIT` walks it: each bit moves to `node + step` for a 0 or `node +
+    /// 2 * step` for a 1, and the step doubles. Returns the node reached; the
+    /// value is that less `1 << count`.
+    #[inline(always)]
+    fn reverse<R: RangeReader>(
+        rc: &mut RangeDecoder<R>,
+        probs: &mut [u16],
+        start: u32,
+        count: u32,
+    ) -> u32 {
+        let mut node = start;
+        let mut step = 1u32;
+        for _ in 0..count {
+            let bit = rc.decode_bit(&mut probs[node as usize]) as u32;
+            step += step;
+            node += if bit == 0 { step >> 1 } else { step };
+        }
+        node
+    }
+
+    /// One LZMA symbol, as 7-Zip's `LzmaDec_DecodeReal` decodes it, into
+    /// the window, over any reader.
+    #[inline(always)]
+    fn decode_symbol<R: RangeReader>(
         probs: &mut [u16],
         lz: &mut WindowParts<'_>,
         st: &mut Symbols,
-        rc: &mut B,
+        rc: &mut RangeDecoder<R>,
     ) -> crate::Result<()> {
         let pos_state = (lz.get_pos() as u32 & st.pb_mask) as usize;
         let mut state = st.state as usize;
-        if rc.bit(&mut probs[IS_MATCH + (pos_state << NUM_POS_BITS_MAX) + state]) == 0 {
+        if rc.decode_bit(&mut probs[IS_MATCH + (pos_state << NUM_POS_BITS_MAX) + state]) == 0 {
             let context = (((lz.get_pos() as u32) << 8) + st.previous) & st.lp_mask;
             let base = LITERAL + 3 * (context << st.lc) as usize;
             let symbol = if state < NUM_LIT_STATES {
                 state -= if state < 4 { state } else { 3 };
-                rc.literal(&mut probs[base..base + 0x100])
+                Self::tree(rc, &mut probs[base..base + 0x100])
             } else {
                 let match_byte = u32::from(lz.get_byte((st.reps[0] - 1) as usize));
                 state -= if state < 10 { 3 } else { 6 };
-                rc.matched_literal(&mut probs[base..base + LIT_SIZE], match_byte)
+                Self::matched_literal(rc, &mut probs[base..base + LIT_SIZE], match_byte)
             };
             st.state = state as u32;
             st.previous = symbol;
             lz.put_byte(symbol as u8);
             return Ok(());
         }
-        if let Some((len, kind)) = rc.match_head(probs, st, pos_state) {
-            match kind {
-                MatchKind::Short => {
-                    if lz.full() == 0 {
-                        return Err(error_other("dist overflow"));
-                    }
-                }
-                MatchKind::Fresh => {
-                    if st.reps[0] == 0 {
-                        st.end_marker = true;
-                        return Err(error_other("dist overflow"));
-                    }
-                    if (st.reps[0] - 1) as usize >= lz.full() {
-                        return Err(error_other("dist overflow"));
-                    }
-                }
-                MatchKind::Repeat => {}
-            }
-            lz.repeat((st.reps[0] - 1) as usize, len as usize)?;
-            st.previous = u32::from(lz.get_byte(0));
-            return Ok(());
-        }
-        let len_base = if rc.bit(&mut probs[IS_REP + state]) == 0 {
+        let len_base = if rc.decode_bit(&mut probs[IS_REP + state]) == 0 {
             state += NUM_STATES;
             LEN_CODER
         } else {
-            if rc.bit(&mut probs[IS_REP_G0 + state]) == 0 {
-                if rc.bit(&mut probs[IS_REP0_LONG + (pos_state << NUM_POS_BITS_MAX) + state]) == 0 {
+            if rc.decode_bit(&mut probs[IS_REP_G0 + state]) == 0 {
+                if rc.decode_bit(&mut probs[IS_REP0_LONG + (pos_state << NUM_POS_BITS_MAX) + state])
+                    == 0
+                {
                     // A short repeat: one byte from the last distance.
                     if lz.full() == 0 {
                         return Err(error_other("dist overflow"));
@@ -1181,10 +1222,10 @@ impl LzmaDecoder {
                     return Ok(());
                 }
             } else {
-                let distance = if rc.bit(&mut probs[IS_REP_G1 + state]) == 0 {
+                let distance = if rc.decode_bit(&mut probs[IS_REP_G1 + state]) == 0 {
                     st.reps[1]
                 } else {
-                    let distance = if rc.bit(&mut probs[IS_REP_G2 + state]) == 0 {
+                    let distance = if rc.decode_bit(&mut probs[IS_REP_G2 + state]) == 0 {
                         st.reps[2]
                     } else {
                         let distance = st.reps[3];
@@ -1204,14 +1245,15 @@ impl LzmaDecoder {
         if state >= NUM_STATES {
             let len_state = (len as usize).min(NUM_LEN_TO_POS_STATES - 1);
             let slot = POS_SLOT + (len_state << NUM_POS_SLOT_BITS);
-            let mut distance = rc.tree(&mut probs[slot..slot + (1 << NUM_POS_SLOT_BITS)]);
+            let mut distance = Self::tree(rc, &mut probs[slot..slot + (1 << NUM_POS_SLOT_BITS)]);
             if distance >= START_POS_MODEL_INDEX {
                 let pos_slot = distance;
                 let mut direct_bits = (distance >> 1) - 1;
                 distance = 2 | (distance & 1);
                 if pos_slot < END_POS_MODEL_INDEX {
                     distance <<= direct_bits;
-                    let node = rc.reverse(
+                    let node = Self::reverse(
+                        rc,
                         &mut probs[SPEC_POS..SPEC_POS + NUM_FULL_DISTANCES],
                         distance + 1,
                         direct_bits,
@@ -1219,9 +1261,11 @@ impl LzmaDecoder {
                     distance = node - (1 << direct_bits);
                 } else {
                     direct_bits -= NUM_ALIGN_BITS;
-                    distance = (distance << direct_bits) | rc.direct_bits(direct_bits);
+                    distance =
+                        (distance << direct_bits) | rc.decode_direct_bits(direct_bits) as u32;
                     distance <<= NUM_ALIGN_BITS;
-                    let node = rc.reverse(
+                    let node = Self::reverse(
+                        rc,
                         &mut probs[ALIGN..ALIGN + ALIGN_TABLE_SIZE],
                         1,
                         NUM_ALIGN_BITS,
@@ -1260,17 +1304,23 @@ impl LzmaDecoder {
     /// table, low and mid trees of three bits per position state, a high
     /// tree of eight.
     #[inline(always)]
-    fn decode_len<B: Bits>(probs: &mut [u16], rc: &mut B, base: usize, pos_state: usize) -> u32 {
+    fn decode_len<R: RangeReader>(
+        probs: &mut [u16],
+        rc: &mut RangeDecoder<R>,
+        base: usize,
+        pos_state: usize,
+    ) -> u32 {
         let len_state = pos_state << (LEN_NUM_LOW_BITS + 1);
-        if rc.bit(&mut probs[base + LEN_CHOICE]) == 0 {
+        if rc.decode_bit(&mut probs[base + LEN_CHOICE]) == 0 {
             let low = base + LEN_LOW + len_state;
-            rc.tree(&mut probs[low..low + LEN_NUM_LOW_SYMBOLS])
-        } else if rc.bit(&mut probs[base + LEN_CHOICE2]) == 0 {
+            Self::tree(rc, &mut probs[low..low + LEN_NUM_LOW_SYMBOLS])
+        } else if rc.decode_bit(&mut probs[base + LEN_CHOICE2]) == 0 {
             let mid = base + LEN_LOW + len_state + LEN_NUM_LOW_SYMBOLS;
-            LEN_NUM_LOW_SYMBOLS as u32 + rc.tree(&mut probs[mid..mid + LEN_NUM_LOW_SYMBOLS])
+            LEN_NUM_LOW_SYMBOLS as u32 + Self::tree(rc, &mut probs[mid..mid + LEN_NUM_LOW_SYMBOLS])
         } else {
             let high = base + LEN_HIGH;
-            2 * LEN_NUM_LOW_SYMBOLS as u32 + rc.tree(&mut probs[high..high + LEN_NUM_HIGH_SYMBOLS])
+            2 * LEN_NUM_LOW_SYMBOLS as u32
+                + Self::tree(rc, &mut probs[high..high + LEN_NUM_HIGH_SYMBOLS])
         }
     }
 }

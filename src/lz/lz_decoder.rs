@@ -262,6 +262,25 @@ impl WindowParts<'_> {
         self.pos < self.limit
     }
 
+    /// The window's buffer, position, limit, fill and size, for a kernel
+    /// that decodes straight into it; [`set_pos`](Self::set_pos) takes the
+    /// position back.
+    #[inline(always)]
+    pub(crate) fn raw_parts(&mut self) -> (*mut u8, usize, usize, usize, usize) {
+        (
+            self.buf.as_mut_ptr(),
+            self.pos,
+            self.limit,
+            self.full(),
+            self.buf_size,
+        )
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_pos(&mut self, pos: usize) {
+        self.pos = pos;
+    }
+
     #[inline(always)]
     pub(crate) fn get_pos(&self) -> usize {
         self.pos
