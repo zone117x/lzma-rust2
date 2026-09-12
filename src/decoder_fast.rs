@@ -359,6 +359,35 @@ macro_rules! tree8 {
     };
 }
 
+// One direct bit of a distance, into `tab`: the range halves, and the code
+// keeps or loses the half. The last bit leaves for `43`.
+macro_rules! direct_bit {
+    () => {
+        concat!(
+            "lsr    {range:w}, {range:w}, #1\n",
+            "subs   {u:w}, {code:w}, {range:w}\n",
+            "add    {tab:w}, {tab:w}, {tab:w}\n",
+            "csel   {code:w}, {code:w}, {u:w}, mi\n",
+            "csinc  {tab:w}, {tab:w}, {tab:w}, mi\n",
+            "subs   {cnt:w}, {cnt:w}, #1\n",
+            "b.eq   43f\n",
+        )
+    };
+}
+
+// The same, after a check of the range: one whose top byte is clear goes
+// to `44`, which normalises it and decodes eight bits before the next
+// check.
+macro_rules! direct_checked {
+    () => {
+        concat!(
+            "tst    {range:w}, #0xFF000000\n",
+            "b.eq   44f\n",
+            direct_bit!(),
+        )
+    };
+}
+
 // A step of a reverse tree over the table named: the nodes a 0 and a 1 lead
 // to and their probabilities loaded before the bit is known, the bit
 // decided, the probability stored, and the walk taken to the node chosen.
@@ -675,18 +704,20 @@ impl Coder<'_> {
                 "sub    {code:w}, {code:w}, {t:w}",
                 "sub    {u:w}, {prob:w}, {prob:w}, lsr #{move_bits}",
                 "strh   {u:w}, [{step}, {n1}]",
-                "add    {tab}, {probs}, {state}, lsl #1",
-                branch_bit!("{tab}", "{o_is_rep}", "30"),
-                // A fresh match: the state moves up, the length coder is the
-                // match one.
-                "add    {state}, {state}, #12",
+                // The state's other tables lie at fixed offsets from its
+                // is-match row.
+                branch_bit!("{step}", "{r_is_rep}", "30"),
+                // A fresh match: the state is marked, the length coder is
+                // the match one.
+                "orr    {state}, {state}, #16",
                 "add    {tab}, {probs}, #{o_len_coder}",
                 "b      40f",
                 "30:",
-                branch_bit_one!("{tab}", "{o_is_rep}"),
-                branch_bit!("{tab}", "{o_is_rep_g0}", "31"),
+                branch_bit_one!("{step}", "{r_is_rep}"),
+                branch_bit!("{step}", "{r_is_rep_g0}", "31"),
                 // The last distance again: one byte, or a length.
-                "add    {cnt}, {tab}, {n1}",
+                "add    {cnt}, {probs}, {state}, lsl #1",
+                "add    {cnt}, {cnt}, {n1}",
                 branch_bit!("{cnt}", "{o_is_rep0_long}", "32"),
                 "cmp    {state:w}, #7",
                 "mov    {t:w}, #9",
@@ -698,21 +729,21 @@ impl Coder<'_> {
                 branch_bit_one!("{cnt}", "{o_is_rep0_long}"),
                 "b      33f",
                 "31:",
-                branch_bit_one!("{tab}", "{o_is_rep_g0}"),
-                branch_bit!("{tab}", "{o_is_rep_g1}", "35"),
+                branch_bit_one!("{step}", "{r_is_rep_g0}"),
+                branch_bit!("{step}", "{r_is_rep_g1}", "35"),
                 // The second distance, moved to the front.
                 "mov    {tab:w}, {rep1:w}",
                 "mov    {rep1:w}, {rep0:w}",
                 "mov    {rep0:w}, {tab:w}",
                 "b      33f",
                 "35:",
-                branch_bit_one!("{tab}", "{o_is_rep_g1}"),
-                branch_bit!("{tab}", "{o_is_rep_g2}", "36"),
+                branch_bit_one!("{step}", "{r_is_rep_g1}"),
+                branch_bit!("{step}", "{r_is_rep_g2}", "36"),
                 // The third distance.
                 "mov    {tab:w}, {rep2:w}",
                 "b      37f",
                 "36:",
-                branch_bit_one!("{tab}", "{o_is_rep_g2}"),
+                branch_bit_one!("{step}", "{r_is_rep_g2}"),
                 // The fourth.
                 "ldr    {tab}, [{p}, #128]",
                 "str    {rep2}, [{p}, #128]",
@@ -751,8 +782,7 @@ impl Coder<'_> {
                 "sub    {cnt:w}, {sym:w}, #238",
                 "45:",
                 // A repeat match copies now.
-                "cmp    {state:w}, #12",
-                "b.lo   50f",
+                "tbz    {state:w}, #4, 50f",
                 // ---- A fresh distance: the slot tree of the length state.
                 // The length waits in the state block meanwhile. ----
                 "str    {cnt}, [{p}, #152]",
@@ -798,19 +828,34 @@ impl Coder<'_> {
                 "sub    {tab:w}, {sym:w}, {step:w}",
                 "b      49f",
                 "46:",
-                // The direct bits, then the four align bits, a reverse tree
-                // from node 1.
+                // The direct bits, each a halving of the range: the first
+                // eight check for a normalisation before each bit, and the
+                // rest go eight to a normalisation, as a normalised range
+                // stands eight halvings. Then the four align bits, a reverse
+                // tree from node 1.
                 "sub    {cnt:w}, {cnt:w}, #4",
+                direct_checked!(),
+                direct_checked!(),
+                direct_checked!(),
+                direct_checked!(),
+                direct_checked!(),
+                direct_checked!(),
+                direct_checked!(),
+                direct_checked!(),
                 "44:",
-                normalize!(),
-                "lsl    {tab:w}, {tab:w}, #1",
-                "orr    {t:w}, {tab:w}, #1",
-                "lsr    {range:w}, {range:w}, #1",
-                "subs   {u:w}, {code:w}, {range:w}",
-                "csel   {code:w}, {u:w}, {code:w}, hs",
-                "csel   {tab:w}, {t:w}, {tab:w}, hs",
-                "subs   {cnt:w}, {cnt:w}, #1",
-                "b.ne   44b",
+                "lsl    {range:w}, {range:w}, #{shift_bits}",
+                "ldrb   {t:w}, [{pos}], #1",
+                "orr    {code:w}, {t:w}, {code:w}, lsl #{shift_bits}",
+                direct_bit!(),
+                direct_bit!(),
+                direct_bit!(),
+                direct_bit!(),
+                direct_bit!(),
+                direct_bit!(),
+                direct_bit!(),
+                direct_bit!(),
+                "b      44b",
+                "43:",
                 "lsl    {tab:w}, {tab:w}, #4",
                 "add    {cnt}, {probs}, #{o_align}",
                 "mov    {sym:w}, #1",
@@ -834,7 +879,7 @@ impl Coder<'_> {
                 "mov    {rep2:w}, {rep1:w}",
                 "mov    {rep1:w}, {rep0:w}",
                 "add    {rep0:w}, {tab:w}, #1",
-                "cmp    {state:w}, #19",
+                "cmp    {state:w}, #23",
                 "mov    {t:w}, #7",
                 "mov    {u:w}, #10",
                 "csel   {state:w}, {t:w}, {u:w}, lo",
@@ -1017,10 +1062,10 @@ impl Coder<'_> {
                 offset = const BIT_MODEL_OFFSET,
                 o_is_match = const IS_MATCH * 2,
                 o_literal = const LITERAL * 2,
-                o_is_rep = const IS_REP * 2,
-                o_is_rep_g0 = const IS_REP_G0 * 2,
-                o_is_rep_g1 = const IS_REP_G1 * 2,
-                o_is_rep_g2 = const IS_REP_G2 * 2,
+                r_is_rep = const (IS_REP - IS_MATCH) * 2,
+                r_is_rep_g0 = const (IS_REP_G0 - IS_MATCH) * 2,
+                r_is_rep_g1 = const (IS_REP_G1 - IS_MATCH) * 2,
+                r_is_rep_g2 = const (IS_REP_G2 - IS_MATCH) * 2,
                 o_is_rep0_long = const IS_REP0_LONG * 2,
                 o_len_coder = const LEN_CODER * 2,
                 o_rep_len_coder = const REP_LEN_CODER * 2,
