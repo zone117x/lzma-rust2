@@ -244,36 +244,128 @@ macro_rules! tree_last_step {
     };
 }
 
-impl Bits for Coder<'_> {
-    #[inline(always)]
-    fn literal(&mut self, probs: &mut [u16]) -> u32 {
-        debug_assert_eq!(probs.len(), 0x100);
-        let mut sym: u64 = 1;
+// A step of a tree kernel for each token given, so that a kernel can be
+// unrolled to its depth.
+macro_rules! tree_step_for {
+    ($_:tt) => {
+        tree_step!()
+    };
+}
 
-        // SAFETY: the node visited at each of the eight steps is `sym`,
-        // below 0x100, and the children loaded ahead by the first seven are
-        // below 0x100 too. Every input read is clamped to the buffer's last
-        // byte. The assembly touches no stack and only the memory named.
+// An unrolled tree kernel: one step per token in the list, then the last
+// step, over a tree of that many bits plus one.
+macro_rules! unrolled_tree {
+    ($name:ident, $bits:literal, [$($step:tt),*]) => {
+        /// A bit tree of this many bits, unrolled.
+        #[inline(always)]
+        fn $name(&mut self, probs: &mut [u16]) -> u32 {
+            debug_assert_eq!(probs.len(), 1 << $bits);
+            let mut sym: u64 = 1;
+
+            // SAFETY: the node visited at each step is `sym`, below the number
+            // of leaves, and the children loaded ahead by every step but the
+            // last are below it too. Every input read is clamped to the
+            // buffer's last byte. The assembly touches no stack and only the
+            // memory named.
+            unsafe {
+                core::arch::asm!(
+                    $(tree_step_for!($step),)*
+                    tree_last_step!(),
+                    range = inout(reg) self.range,
+                    code = inout(reg) self.code,
+                    pos = inout(reg) self.pos,
+                    sym = inout(reg) sym,
+                    probs = in(reg) probs.as_mut_ptr(),
+                    buf = in(reg) self.buf.as_ptr(),
+                    last = in(reg) self.buf.len() - 1,
+                    prob = inout(reg) u32::from(probs[1]) => _,
+                    p0 = out(reg) _,
+                    p1 = out(reg) _,
+                    t = out(reg) _,
+                    u = out(reg) _,
+                    v = out(reg) _,
+                    shift_bits = const SHIFT_BITS,
+                    total_bits = const BIT_MODEL_TOTAL_BITS,
+                    move_bits = const MOVE_BITS,
+                    offset = const BIT_MODEL_OFFSET,
+                    options(nostack),
+                );
+            }
+            sym as u32 - (1 << $bits)
+        }
+    };
+}
+
+// A step of a reverse tree kernel: the nodes a 0 and a 1 lead to and their
+// probabilities loaded before the bit is known, the bit decided, the
+// probability stored, and the walk taken to the node chosen.
+macro_rules! reverse_step {
+    () => {
+        concat!(
+            normalize!(),
+            "add    {n0}, {node}, {step}\n",
+            "add    {step}, {step}, {step}\n",
+            "add    {n1}, {node}, {step}\n",
+            "ldrh   {p0:w}, [{probs}, {n0}, lsl #1]\n",
+            "ldrh   {p1:w}, [{probs}, {n1}, lsl #1]\n",
+            decide!(),
+            "strh   {u:w}, [{probs}, {node}, lsl #1]\n",
+            "csel   {node}, {n1}, {n0}, hs\n",
+            "csel   {prob:w}, {p1:w}, {p0:w}, hs\n",
+        )
+    };
+}
+
+// The last step of a reverse tree, which loads no children.
+macro_rules! reverse_last_step {
+    () => {
+        concat!(
+            normalize!(),
+            decide!(),
+            "strh   {u:w}, [{probs}, {node}, lsl #1]\n",
+            "add    {n0}, {node}, {step}\n",
+            "add    {step}, {step}, {step}\n",
+            "add    {n1}, {node}, {step}\n",
+            "csel   {node}, {n1}, {n0}, hs\n",
+        )
+    };
+}
+
+impl Coder<'_> {
+    unrolled_tree!(tree3, 3, [a, a]);
+    unrolled_tree!(tree6, 6, [a, a, a, a, a]);
+    unrolled_tree!(tree8, 8, [a, a, a, a, a, a, a]);
+
+    /// The four align bits of a distance, a reverse tree from node 1,
+    /// unrolled; returns the node reached, the value plus sixteen.
+    #[inline(always)]
+    fn align(&mut self, probs: &mut [u16]) -> u32 {
+        debug_assert_eq!(probs.len(), ALIGN_TABLE_SIZE);
+        let mut node: u64 = 1;
+
+        // SAFETY: the nodes visited are 1, then one of 2 and 3, of 4 to 7, of
+        // 8 to 15, all inside the sixteen; the last step loads none. Every
+        // input read is clamped to the buffer's last byte. The assembly
+        // touches no stack and only the memory named.
         unsafe {
             core::arch::asm!(
-                tree_step!(),
-                tree_step!(),
-                tree_step!(),
-                tree_step!(),
-                tree_step!(),
-                tree_step!(),
-                tree_step!(),
-                tree_last_step!(),
+                reverse_step!(),
+                reverse_step!(),
+                reverse_step!(),
+                reverse_last_step!(),
                 range = inout(reg) self.range,
                 code = inout(reg) self.code,
                 pos = inout(reg) self.pos,
-                sym = inout(reg) sym,
+                node = inout(reg) node,
+                step = inout(reg) 1u64 => _,
                 probs = in(reg) probs.as_mut_ptr(),
                 buf = in(reg) self.buf.as_ptr(),
                 last = in(reg) self.buf.len() - 1,
                 prob = inout(reg) u32::from(probs[1]) => _,
                 p0 = out(reg) _,
                 p1 = out(reg) _,
+                n0 = out(reg) _,
+                n1 = out(reg) _,
                 t = out(reg) _,
                 u = out(reg) _,
                 v = out(reg) _,
@@ -284,7 +376,14 @@ impl Bits for Coder<'_> {
                 options(nostack),
             );
         }
-        sym as u32 - 0x100
+        node as u32
+    }
+}
+
+impl Bits for Coder<'_> {
+    #[inline(always)]
+    fn literal(&mut self, probs: &mut [u16]) -> u32 {
+        self.tree8(probs)
     }
 
     /// A single bit, the ones the decoder branches on, in Rust: the same
@@ -312,6 +411,14 @@ impl Bits for Coder<'_> {
     #[inline(always)]
     fn tree(&mut self, probs: &mut [u16]) -> u32 {
         debug_assert!(probs.len() >= 2 && probs.len().is_power_of_two());
+        // The sizes the format has, unrolled; the length is a constant at
+        // every call, so this is no branch.
+        match probs.len() {
+            8 => return self.tree3(probs),
+            64 => return self.tree6(probs),
+            256 => return self.tree8(probs),
+            _ => {}
+        }
         let count = probs.len().trailing_zeros();
         let mut sym: u64 = 1;
 
@@ -421,6 +528,9 @@ impl Bits for Coder<'_> {
     #[inline(always)]
     fn reverse(&mut self, probs: &mut [u16], start: u32, count: u32) -> u32 {
         debug_assert!(count >= 1 && probs.len() >= 2);
+        if probs.len() == ALIGN_TABLE_SIZE && start == 1 && count == NUM_ALIGN_BITS {
+            return self.align(probs);
+        }
         let mut node: u64 = u64::from(start);
 
         // SAFETY: the caller keeps every node visited inside `probs`; the two
