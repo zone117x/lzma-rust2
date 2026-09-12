@@ -334,8 +334,8 @@ impl WindowParts<'_> {
         // is no loop and no call for the few bytes most matches are.
         let pos = self.pos;
         if len < 16
-            && dist + 1 <= pos
-            && dist + 1 >= 16
+            && dist < pos
+            && dist >= 15
             && pos + 16 <= self.buf_size
             && pos + len <= self.limit
         {

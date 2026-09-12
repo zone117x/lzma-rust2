@@ -721,7 +721,6 @@ impl Coder<'_> {
                 "b.hs   16f",
                 "cmp    {state:w}, #4",
                 "b.hs   15f",
-                ".p2align 6",
                 // ---- After a literal: the state was below 4, and a literal
                 // takes it to 0. ----
                 "14:",
