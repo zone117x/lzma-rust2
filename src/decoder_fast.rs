@@ -432,86 +432,134 @@ macro_rules! reverse_last_step {
     };
 }
 
-// The matched literal in the shape of the SDK's, which like the tree step
-// decodes measurably faster than the same instructions in another order.
-// The match byte's next bit picks the coder: the index is `offs + bit +
-// sym`, where `bit` is the offset so far and `offs` keeps it only while the
-// match byte's bit is set, and a decoded 0 that disagrees with the match
-// byte drops the offset. The table pointer `step` carries `offs + bit` from
-// one step to the next, the match byte is `cnt`, shifted up as it goes, the
-// match bit's mask `n1`, the offset `n0`.
-macro_rules! matched_first {
-    () => {
+// The matched literal, decoded two bits ahead. Its coder has three rows of
+// 0x100 probabilities: while the bits decoded so far agree with the match
+// byte's, the offset `n0` is 0x100 and the row is the offset plus the match
+// byte's next bit as 0x100, `n1`, and once a bit disagrees the offset is 0
+// for the rest of the byte and the row is 0. The probability of a bit is at
+// the row plus the tree node `sym`. The SDK loads it after the bit before
+// is known, since the row depends on that bit, which puts the load's
+// latency on the path between one bit and the next. The kernel loads both
+// probabilities a bit may lead to before the bit is decoded, as it does for
+// a tree, and for that it loads the four a pair of bits may lead to two
+// bits ahead: the four in the row 0 at the four nodes two levels down,
+// which are two words, and the one in the row the offset leads to if both
+// bits agree with the match byte, `tab2`. When the first of the two bits is
+// known it picks a word, whose halves the second bit will pick between, and
+// the one probability of the agreeing row takes the half it belongs to if
+// the offset is still up. The match byte is `cnt` shifted up by 8, so that
+// bit `k` of the byte is bit `15 - k` of `cnt`; the shifts are the step's.
+// Two pairs of registers hold the words in turn, one pair loaded while the
+// other is picked from.
+
+// The match byte's bit of this step as 0x100, masked by the offset.
+macro_rules! ml_bit {
+    ($shift:literal) => {
+        concat!("and    {n1}, {n0}, {cnt}, lsr #", $shift, "\n")
+    };
+}
+
+// The word the bit before picked, its halves as the next bit's two
+// probabilities, and the agreeing row's probability into the half it
+// belongs to if the offset is still up.
+macro_rules! ml_pair {
+    ($a:literal, $b:literal) => {
         concat!(
-            "lsl    {cnt:w}, {cnt:w}, #2\n",
-            "and    {n1:w}, {cnt:w}, #0x200\n",
-            "add    {step}, {tab}, #0x202\n",
-            "add    {cnt:w}, {cnt:w}, {cnt:w}\n",
-            "add    {step}, {step}, {n1}\n",
-            "eor    {n0:w}, {n1:w}, #0x200\n",
-            "ldrh   {prob:w}, [{step}]\n",
-            normalize!(),
-            "lsr    {t:w}, {range:w}, #{total_bits}\n",
-            "sub    {u:w}, {prob:w}, #{offset}\n",
-            "mul    {t:w}, {t:w}, {prob:w}\n",
-            "subs   {v:w}, {code:w}, {t:w}\n",
-            "sub    {range:w}, {range:w}, {t:w}\n",
-            "csel   {n0:w}, {n1:w}, {n0:w}, hs\n",
-            "csel   {range:w}, {t:w}, {range:w}, lo\n",
-            "and    {n1:w}, {cnt:w}, {n0:w}\n",
-            "csel   {u:w}, {prob:w}, {u:w}, hs\n",
-            "csel   {code:w}, {v:w}, {code:w}, hs\n",
-            "mov    {sym:w}, #2\n",
-            "sub    {u:w}, {prob:w}, {u:w}, asr #{move_bits}\n",
-            "strh   {u:w}, [{step}]\n",
-            "add    {step}, {tab}, {n0}\n",
-            "adc    {sym:w}, {sym:w}, wzr\n",
+            "csel   ",
+            $a,
+            ", ",
+            $b,
+            ", ",
+            $a,
+            ", hs\n",
+            "lsr    ",
+            $b,
+            ", ",
+            $a,
+            ", #16\n",
+            "and    ",
+            $a,
+            ", ",
+            $a,
+            ", #0xFFFF\n",
+            "cmp    {n0}, {n1}\n",
+            "csel   ",
+            $a,
+            ", {tab2:w}, ",
+            $a,
+            ", ne\n",
+            "cmp    {n1}, #0\n",
+            "csel   ",
+            $b,
+            ", {tab2:w}, ",
+            $b,
+            ", ne\n",
         )
     };
 }
 
-macro_rules! matched_step {
-    () => {
+// The loads two bits ahead: the agreeing row's probability at the node the
+// match byte's next two bits lead to, and the two words of row 0 at the
+// four nodes two levels down.
+macro_rules! ml_loads {
+    ($pair_shift:literal, $third_shift:literal, $a:literal, $b:literal) => {
         concat!(
-            "add    {step}, {step}, {n1}\n",
-            "eor    {n0:w}, {n0:w}, {n1:w}\n",
-            "ldrh   {prob:w}, [{step}, {sym}, lsl #1]\n",
-            normalize!(),
-            "lsr    {t:w}, {range:w}, #{total_bits}\n",
-            "add    {cnt:w}, {cnt:w}, {cnt:w}\n",
-            "sub    {u:w}, {prob:w}, #{offset}\n",
-            "mul    {t:w}, {t:w}, {prob:w}\n",
-            "subs   {v:w}, {code:w}, {t:w}\n",
-            "sub    {range:w}, {range:w}, {t:w}\n",
-            "csel   {n0:w}, {n1:w}, {n0:w}, hs\n",
-            "csel   {range:w}, {t:w}, {range:w}, lo\n",
-            "and    {n1:w}, {cnt:w}, {n0:w}\n",
-            "csel   {u:w}, {prob:w}, {u:w}, hs\n",
-            "csel   {code:w}, {v:w}, {code:w}, hs\n",
-            "sub    {u:w}, {prob:w}, {u:w}, asr #{move_bits}\n",
-            "strh   {u:w}, [{step}, {sym}, lsl #1]\n",
-            "add    {step}, {tab}, {n0}\n",
-            "adc    {sym:w}, {sym:w}, {sym:w}\n",
+            "ubfx   {t}, {cnt}, #",
+            $pair_shift,
+            ", #2\n",
+            "and    {u}, {n0}, {cnt}, lsr #",
+            $third_shift,
+            "\n",
+            "add    {u}, {u}, {n0}\n",
+            "add    {t}, {t}, {u}\n",
+            "add    {t}, {t}, {sym}, lsl #2\n",
+            "ldrh   {tab2:w}, [{tab}, {t}, lsl #1]\n",
+            "add    {u}, {tab}, {sym}, lsl #3\n",
+            "ldr    ",
+            $a,
+            ", [{u}]\n",
+            "ldr    ",
+            $b,
+            ", [{u}, #4]\n",
         )
     };
 }
 
-macro_rules! matched_last {
+// The bit itself, with the SDK's range and code updates, the probability
+// updated in its row, and the offset kept if the bit agrees with the match
+// byte's.
+macro_rules! ml_decide {
     () => {
         concat!(
-            "add    {step}, {step}, {n1}\n",
-            "ldrh   {prob:w}, [{step}, {sym}, lsl #1]\n",
             normalize!(),
             "lsr    {t:w}, {range:w}, #{total_bits}\n",
-            "sub    {u:w}, {prob:w}, #{offset}\n",
+            "eor    {u:w}, {n0:w}, {n1:w}\n",
             "mul    {t:w}, {t:w}, {prob:w}\n",
             "subs   {v:w}, {code:w}, {t:w}\n",
             "sub    {range:w}, {range:w}, {t:w}\n",
             "csel   {range:w}, {t:w}, {range:w}, lo\n",
-            "csel   {u:w}, {prob:w}, {u:w}, hs\n",
+            "add    {t}, {tab}, {n0}, lsl #1\n",
+            "add    {t}, {t}, {n1}, lsl #1\n",
+            "csel   {n0:w}, {n1:w}, {u:w}, hs\n",
             "csel   {code:w}, {v:w}, {code:w}, hs\n",
+            "sub    {u:w}, {prob:w}, #{offset}\n",
+            "csel   {u:w}, {prob:w}, {u:w}, hs\n",
             "sub    {u:w}, {prob:w}, {u:w}, asr #{move_bits}\n",
-            "strh   {u:w}, [{step}, {sym}, lsl #1]\n",
+            "strh   {u:w}, [{t}, {sym}, lsl #1]\n",
+        )
+    };
+}
+
+// The next bit's probability from the two the bit picks between, and the
+// node.
+macro_rules! ml_next {
+    ($a:literal, $b:literal) => {
+        concat!(
+            "csel   {prob:w}, ",
+            $a,
+            ", ",
+            $b,
+            ", lo\n",
             "adc    {sym:w}, {sym:w}, {sym:w}\n",
         )
     };
@@ -647,8 +695,7 @@ impl Coder<'_> {
                 "ldp    {code}, {dic}, [{p}, #48]",
                 "ldp    {dpos}, {dlim}, [{p}, #64]",
                 "ldr    {state}, [{p}, #96]",
-                "ldp    {rep0}, {rep1}, [{p}, #104]",
-                "ldr    {rep2}, [{p}, #120]",
+                "ldr    {rep0}, [{p}, #104]",
                 "ldp    {sym}, {masks}, [{p}, #136]",
                 "ubfx   {pbm}, {masks}, #16, #4",
                 "lsl    {pbm}, {pbm}, #5",
@@ -731,25 +778,28 @@ impl Coder<'_> {
                 "31:",
                 branch_bit_one!("{step}", "{r_is_rep_g0}"),
                 branch_bit!("{step}", "{r_is_rep_g1}", "35"),
-                // The second distance, moved to the front.
-                "mov    {tab:w}, {rep1:w}",
-                "mov    {rep1:w}, {rep0:w}",
+                // The second distance, moved to the front. The distances
+                // after the first live in memory, used too rarely to hold
+                // registers.
+                "ldr    {tab}, [{p}, #112]",
+                "str    {rep0}, [{p}, #112]",
                 "mov    {rep0:w}, {tab:w}",
                 "b      33f",
                 "35:",
                 branch_bit_one!("{step}", "{r_is_rep_g1}"),
                 branch_bit!("{step}", "{r_is_rep_g2}", "36"),
                 // The third distance.
-                "mov    {tab:w}, {rep2:w}",
-                "b      37f",
+                "ldp    {t}, {tab}, [{p}, #112]",
+                "stp    {rep0}, {t}, [{p}, #112]",
+                "mov    {rep0:w}, {tab:w}",
+                "b      33f",
                 "36:",
                 branch_bit_one!("{step}", "{r_is_rep_g2}"),
                 // The fourth.
+                "ldp    {t}, {u}, [{p}, #112]",
                 "ldr    {tab}, [{p}, #128]",
-                "str    {rep2}, [{p}, #128]",
-                "37:",
-                "mov    {rep2:w}, {rep1:w}",
-                "mov    {rep1:w}, {rep0:w}",
+                "stp    {rep0}, {t}, [{p}, #112]",
+                "str    {u}, [{p}, #128]",
                 "mov    {rep0:w}, {tab:w}",
                 "33:",
                 // A repeat match with a length: the state, the repeat length
@@ -875,9 +925,9 @@ impl Coder<'_> {
                 // back, and the distance is checked for the end marker and
                 // against the window's fill, which is the position until the
                 // window first wraps.
-                "str    {rep2}, [{p}, #128]",
-                "mov    {rep2:w}, {rep1:w}",
-                "mov    {rep1:w}, {rep0:w}",
+                "ldp    {t}, {u}, [{p}, #112]",
+                "stp    {rep0}, {t}, [{p}, #112]",
+                "str    {u}, [{p}, #128]",
                 "add    {rep0:w}, {tab:w}, #1",
                 "cmp    {state:w}, #23",
                 "mov    {t:w}, #7",
@@ -990,14 +1040,59 @@ impl Coder<'_> {
                 "cmp    {dpos}, {rep0}",
                 "csel   {t}, {u}, {t}, lo",
                 "ldrb   {cnt:w}, [{dic}, {t}]",
-                matched_first!(),
-                matched_step!(),
-                matched_step!(),
-                matched_step!(),
-                matched_step!(),
-                matched_step!(),
-                matched_step!(),
-                matched_last!(),
+                // The first bit's probability, and the second's two, which
+                // the first bit alone decides, loaded outright.
+                "lsl    {cnt}, {cnt}, #8",
+                "mov    {n0}, #0x100",
+                ml_bit!("7"),
+                "add    {t}, {n1}, #0x101",
+                "ldrh   {prob:w}, [{tab}, {t}, lsl #1]",
+                "mov    {sym}, #1",
+                "eor    {u}, {n0}, {n1}",
+                "and    {t}, {n0}, {cnt}, lsr #6",
+                "and    {v}, {u}, {t}",
+                "add    {v}, {v}, {u}",
+                "add    {v}, {v}, #2",
+                "ldrh   {rep1:w}, [{tab}, {v}, lsl #1]",
+                "and    {v}, {n1}, {t}",
+                "add    {v}, {v}, {n1}",
+                "add    {v}, {v}, #3",
+                "ldrh   {rep2:w}, [{tab}, {v}, lsl #1]",
+                ml_loads!("14", "5", "{p1:w}", "{step:w}"),
+                ml_decide!(),
+                ml_next!("{rep1:w}", "{rep2:w}"),
+                ml_bit!("6"),
+                ml_pair!("{p1:w}", "{step:w}"),
+                ml_loads!("13", "4", "{rep1:w}", "{rep2:w}"),
+                ml_decide!(),
+                ml_next!("{p1:w}", "{step:w}"),
+                ml_bit!("5"),
+                ml_pair!("{rep1:w}", "{rep2:w}"),
+                ml_loads!("12", "3", "{p1:w}", "{step:w}"),
+                ml_decide!(),
+                ml_next!("{rep1:w}", "{rep2:w}"),
+                ml_bit!("4"),
+                ml_pair!("{p1:w}", "{step:w}"),
+                ml_loads!("11", "2", "{rep1:w}", "{rep2:w}"),
+                ml_decide!(),
+                ml_next!("{p1:w}", "{step:w}"),
+                ml_bit!("3"),
+                ml_pair!("{rep1:w}", "{rep2:w}"),
+                ml_loads!("10", "1", "{p1:w}", "{step:w}"),
+                ml_decide!(),
+                ml_next!("{rep1:w}", "{rep2:w}"),
+                ml_bit!("2"),
+                ml_pair!("{p1:w}", "{step:w}"),
+                ml_loads!("9", "0", "{rep1:w}", "{rep2:w}"),
+                ml_decide!(),
+                ml_next!("{p1:w}", "{step:w}"),
+                ml_bit!("1"),
+                ml_pair!("{rep1:w}", "{rep2:w}"),
+                ml_decide!(),
+                ml_next!("{rep1:w}", "{rep2:w}"),
+                ml_bit!("0"),
+                ml_decide!(),
+                "adc    {sym:w}, {sym:w}, {sym:w}",
                 "add    {n0}, {dpos}, #1",
                 next_symbol!("{n0}"),
                 "strb   {sym:w}, [{dic}, {dpos}]",
@@ -1022,8 +1117,7 @@ impl Coder<'_> {
                 "stp    {range}, {code}, [{p}, #40]",
                 "str    {dpos}, [{p}, #64]",
                 "str    {state}, [{p}, #96]",
-                "stp    {rep0}, {rep1}, [{p}, #104]",
-                "str    {rep2}, [{p}, #120]",
+                "str    {rep0}, [{p}, #104]",
                 "and    {sym}, {sym}, #0xFF",
                 "str    {sym}, [{p}, #136]",
                 "stp    {cnt}, {t}, [{p}, #152]",
