@@ -81,6 +81,7 @@ struct Symbols {
     /// The last byte of the output, the literal context; 0 before the first.
     previous: u32,
     lc: u32,
+    lp: u32,
     lp_mask: u32,
     pb_mask: u32,
     end_marker: bool,
@@ -156,9 +157,11 @@ macro_rules! branch_bit {
     };
 }
 
-// The same with the probability loaded already, into `prob`.
-macro_rules! branch_bit_loaded {
-    ($tab:literal, $off:literal, $one:literal) => {
+// The is-match bit, whose probability is loaded already, into `prob`, from
+// the state's row `step` of the table at the position state's column `n1`:
+// a jump to the match label named for a match, the fall-through a literal.
+macro_rules! is_match_bit {
+    ($one:literal) => {
         concat!(
             normalize!(),
             "lsr    {t:w}, {range:w}, #{total_bits}\n",
@@ -166,32 +169,55 @@ macro_rules! branch_bit_loaded {
             "cmp    {code:w}, {t:w}\n",
             "b.hs   ",
             $one,
-            "f\n",
+            "\n",
             "mov    {range:w}, {t:w}\n",
             "sub    {u:w}, {prob:w}, #{offset}\n",
             "sub    {u:w}, {prob:w}, {u:w}, asr #{move_bits}\n",
-            "strh   {u:w}, [",
-            $tab,
-            ", #",
-            $off,
-            "]\n",
+            "strh   {u:w}, [{step}, {n1}]\n",
         )
     };
 }
 
-// The is-match table of the next symbol, from the position and the state
-// as they will be, into `step`, and its probability into `prob`: computed
-// while the current symbol is still being decoded, so that the next symbol
-// starts with the load done.
-macro_rules! next_is_match {
+// What the next symbol needs from the position and the state as they will
+// be, computed while the current symbol is still being decoded: the
+// is-match row and column into `step` and `n1`, whose probability is loaded
+// into `prob` as soon as `prob` is free, and the literal coders of the
+// position's `lp` bits into `n0`, so that the coder of the next literal is
+// found from the last byte alone. `masks` holds `8 - lc` in its low byte,
+// the mask of `lc` bits in the next, the position bits' mask in the next,
+// and the `lp` bits' mask shifted by `lc` in its high word.
+macro_rules! next_symbol {
     ($pos:literal) => {
         concat!(
-            "ubfx   {t}, {masks}, #8, #8\n",
-            "and    {step}, {t}, ",
+            "and    {n1}, {pbm}, ",
             $pos,
-            ", lsl #{pos_bits}\n",
-            "add    {step}, {probs}, {step}, lsl #1\n",
-            "add    {step}, {step}, {state}, lsl #1\n",
+            ", lsl #5\n",
+            "add    {step}, {pim}, {state}, lsl #1\n",
+            "lsl    {n0}, ",
+            $pos,
+            ", #8\n",
+            "lsr    {n0}, {n0}, {masks}\n",
+            "and    {n0}, {n0}, {masks}, lsr #32\n",
+            "add    {t}, {probs}, #{o_literal}\n",
+            "add    {n0}, {n0}, {n0}, lsl #1\n",
+            "add    {n0}, {t}, {n0}, lsl #9\n",
+        )
+    };
+}
+
+// The coder of a literal, into `tab`: the top `lc` bits of the last byte,
+// `sym`, over the coders of the position in `n0`, each coder 0x300
+// probabilities. This is the chain from the last bit of one literal to the
+// first of the next, so it is as short as it can be: the leading one the
+// byte carries out of its tree goes with the mask.
+macro_rules! literal_coder {
+    () => {
+        concat!(
+            "ubfx   {t}, {masks}, #8, #8\n",
+            "lsr    {tab}, {sym}, {masks}\n",
+            "and    {tab}, {tab}, {t}\n",
+            "add    {tab}, {tab}, {tab}, lsl #1\n",
+            "add    {tab}, {n0}, {tab}, lsl #9\n",
         )
     };
 }
@@ -344,7 +370,7 @@ macro_rules! reverse_step {
             "add    {n0}, {sym}, {step}\n",
             "add    {step}, {step}, {step}\n",
             "add    {n1}, {sym}, {step}\n",
-            "ldrh   {p0:w}, [",
+            "ldrh   {v:w}, [",
             $tab,
             ", {n0}, lsl #1]\n",
             "ldrh   {p1:w}, [",
@@ -355,7 +381,7 @@ macro_rules! reverse_step {
             $tab,
             ", {sym}, lsl #1]\n",
             "csel   {sym}, {n1}, {n0}, hs\n",
-            "csel   {prob:w}, {p1:w}, {p0:w}, hs\n",
+            "csel   {prob:w}, {p1:w}, {v:w}, hs\n",
         )
     };
 }
@@ -563,9 +589,10 @@ impl Coder<'_> {
             state: u64::from(st.state),
             reps: st.reps.map(u64::from),
             previous: u64::from(st.previous),
-            masks: u64::from(st.lc)
-                | (u64::from(st.pb_mask) << (8 + NUM_POS_BITS_MAX))
-                | (u64::from(st.lp_mask) << (32 + st.lc)),
+            masks: u64::from(8 - st.lc)
+                | (((1u64 << st.lc) - 1) << 8)
+                | (u64::from(st.pb_mask) << 16)
+                | ((((1u64 << st.lp) - 1) << st.lc) << 32),
             len: 0,
             exit: 0,
         };
@@ -582,82 +609,72 @@ impl Coder<'_> {
         // pointer and restored.
         unsafe {
             core::arch::asm!(
-                // The state into registers.
+                // The state into registers. The fourth repeat distance
+                // stays in memory, used too rarely to hold a register.
                 "str    {p}, [sp, #-16]!",
                 "ldr    {probs}, [{p}]",
-                "ldr    {pos}, [{p}, #16]",
-                "ldp    {range}, {code}, [{p}, #40]",
-                "ldp    {dic}, {dpos}, [{p}, #56]",
-                "ldr    {dlim}, [{p}, #72]",
+                "ldp    {pos}, {t}, [{p}, #16]",
+                "ldp    {stop}, {range}, [{p}, #32]",
+                "ldp    {code}, {dic}, [{p}, #48]",
+                "ldp    {dpos}, {dlim}, [{p}, #64]",
                 "ldr    {state}, [{p}, #96]",
                 "ldp    {rep0}, {rep1}, [{p}, #104]",
-                "ldp    {rep2}, {rep3}, [{p}, #120]",
-                "ldp    {prev}, {masks}, [{p}, #136]",
-                // ---- The first symbol's is-match table and probability;
-                // every later symbol has them ready from the one before. ----
-                next_is_match!("{dpos}"),
-                "ldrh   {prob:w}, [{step}, #{o_is_match}]",
+                "ldr    {rep2}, [{p}, #120]",
+                "ldp    {sym}, {masks}, [{p}, #136]",
+                "ubfx   {pbm}, {masks}, #16, #4",
+                "lsl    {pbm}, {pbm}, #5",
+                "add    {pim}, {probs}, #{o_is_match}",
+                // ---- The first symbol's is-match row, column and
+                // probability; every later symbol has them ready from the one
+                // before. The state says which head it starts at: the one
+                // after a match, after a matched literal, or after a
+                // literal, which know the state's next value without asking.
+                // ----
+                next_symbol!("{dpos}"),
+                "ldrh   {prob:w}, [{step}, {n1}]",
+                "cmp    {state:w}, #7",
+                "b.hs   16f",
+                "cmp    {state:w}, #4",
+                "b.hs   15f",
                 ".p2align 6",
-                "10:",
+                // ---- After a literal: the state was below 4, and a literal
+                // takes it to 0. ----
+                "14:",
                 "cmp    {dpos}, {dlim}",
                 "b.hs   90f",
-                "ldr    {t}, [{p}, #32]",
-                "cmp    {pos}, {t}",
+                "cmp    {pos}, {stop}",
                 "b.hi   90f",
-                // The is-match bit at the position state and the state.
-                branch_bit_loaded!("{step}", "{o_is_match}", "20"),
-                // ---- A literal: the coder of the last byte and the position. ----
-                "add    {tab}, {prev}, {dpos}, lsl #8",
-                "lsl    {tab}, {tab}, {masks}",
-                "and    {tab}, {tab}, {masks}, lsr #32",
-                "add    {tab}, {tab}, {tab}, lsl #1",
-                "add    {tab}, {probs}, {tab}, lsl #1",
-                "add    {tab}, {tab}, #{o_literal}",
-                "cmp    {state:w}, #7",
-                "b.hs   12f",
-                // A plain literal; the state falls back towards 0.
-                "cmp    {state:w}, #4",
-                "sub    {t:w}, {state:w}, #3",
-                "csel   {state:w}, wzr, {t:w}, lo",
+                is_match_bit!("20f"),
+                "mov    {state:w}, wzr",
+                // ---- A literal: the coder of the last byte, which is `sym`,
+                // and the position. ----
+                "11:",
+                literal_coder!(),
                 "add    {n0}, {dpos}, #1",
-                next_is_match!("{n0}"),
+                next_symbol!("{n0}"),
                 tree8!("{tab}"),
                 "13:",
                 // The byte, which is the next literal's context.
                 "strb   {sym:w}, [{dic}, {dpos}]",
                 "add    {dpos}, {dpos}, #1",
-                "and    {prev:w}, {sym:w}, #0xFF",
-                "ldrh   {prob:w}, [{step}, #{o_is_match}]",
-                "b      10b",
-                "12:",
-                // A literal against the byte at the last distance, which may
-                // lie before the window's start and wrap.
-                "cmp    {state:w}, #10",
-                "sub    {t:w}, {state:w}, #3",
-                "sub    {u:w}, {state:w}, #6",
-                "csel   {state:w}, {t:w}, {u:w}, lo",
-                "sub    {t}, {dpos}, {rep0}",
-                "ldr    {u}, [{p}, #88]",
-                "add    {u}, {t}, {u}",
-                "cmp    {dpos}, {rep0}",
-                "csel   {t}, {u}, {t}, lo",
-                "ldrb   {cnt:w}, [{dic}, {t}]",
-                matched_first!(),
-                matched_step!(),
-                matched_step!(),
-                matched_step!(),
-                matched_step!(),
-                matched_step!(),
-                matched_step!(),
-                matched_last!(),
-                "add    {n0}, {dpos}, #1",
-                next_is_match!("{n0}"),
-                "b      13b",
+                "ldrh   {prob:w}, [{step}, {n1}]",
+                "b      14b",
+                // ---- After a matched literal: the state is 4 to 6, and a
+                // literal takes it down by 3. ----
+                "15:",
+                "cmp    {dpos}, {dlim}",
+                "b.hs   90f",
+                "cmp    {pos}, {stop}",
+                "b.hi   90f",
+                is_match_bit!("20f"),
+                "sub    {state:w}, {state:w}, #3",
+                "b      11b",
                 // ---- A match: the is-rep and repeat bits sit at the state. ----
                 "20:",
-                branch_bit_one!("{step}", "{o_is_match}"),
-                "ubfx   {t}, {masks}, #8, #8",
-                "and    {n0}, {t}, {dpos}, lsl #{pos_bits}",
+                "sub    {range:w}, {range:w}, {t:w}",
+                "sub    {code:w}, {code:w}, {t:w}",
+                "sub    {u:w}, {prob:w}, {prob:w}, lsr #{move_bits}",
+                "strh   {u:w}, [{step}, {n1}]",
                 "add    {tab}, {probs}, {state}, lsl #1",
                 branch_bit!("{tab}", "{o_is_rep}", "30"),
                 // A fresh match: the state moves up, the length coder is the
@@ -669,8 +686,8 @@ impl Coder<'_> {
                 branch_bit_one!("{tab}", "{o_is_rep}"),
                 branch_bit!("{tab}", "{o_is_rep_g0}", "31"),
                 // The last distance again: one byte, or a length.
-                "add    {n1}, {tab}, {n0}, lsl #1",
-                branch_bit!("{n1}", "{o_is_rep0_long}", "32"),
+                "add    {cnt}, {tab}, {n1}",
+                branch_bit!("{cnt}", "{o_is_rep0_long}", "32"),
                 "cmp    {state:w}, #7",
                 "mov    {t:w}, #9",
                 "mov    {u:w}, #11",
@@ -678,7 +695,7 @@ impl Coder<'_> {
                 "mov    {cnt:w}, #1",
                 "b      50f",
                 "32:",
-                branch_bit_one!("{n1}", "{o_is_rep0_long}"),
+                branch_bit_one!("{cnt}", "{o_is_rep0_long}"),
                 "b      33f",
                 "31:",
                 branch_bit_one!("{tab}", "{o_is_rep_g0}"),
@@ -697,8 +714,8 @@ impl Coder<'_> {
                 "36:",
                 branch_bit_one!("{tab}", "{o_is_rep_g2}"),
                 // The fourth.
-                "mov    {tab:w}, {rep3:w}",
-                "mov    {rep3:w}, {rep2:w}",
+                "ldr    {tab}, [{p}, #128]",
+                "str    {rep2}, [{p}, #128]",
                 "37:",
                 "mov    {rep2:w}, {rep1:w}",
                 "mov    {rep1:w}, {rep0:w}",
@@ -715,14 +732,14 @@ impl Coder<'_> {
                 // ---- The length in bytes: two choice bits, then the low or
                 // mid tree at the position state or the high tree. ----
                 branch_bit!("{tab}", "0", "41"),
-                "add    {n1}, {tab}, {n0}, lsl #1",
+                "add    {n1}, {tab}, {n1}",
                 tree3!("{n1}"),
                 "sub    {cnt:w}, {sym:w}, #6",
                 "b      45f",
                 "41:",
                 branch_bit_one!("{tab}", "0"),
                 branch_bit!("{tab}", "16", "42"),
-                "add    {n1}, {tab}, {n0}, lsl #1",
+                "add    {n1}, {tab}, {n1}",
                 "add    {n1}, {n1}, #16",
                 tree3!("{n1}"),
                 "add    {cnt:w}, {sym:w}, #2",
@@ -770,13 +787,13 @@ impl Coder<'_> {
                 "add    {step}, {step}, {step}",
                 "add    {n1}, {sym}, {step}",
                 "csel   {t}, xzr, {n0}, eq",
-                "ldrh   {p0:w}, [{probs}, {t}, lsl #1]",
+                "ldrh   {v:w}, [{probs}, {t}, lsl #1]",
                 "csel   {t}, xzr, {n1}, eq",
                 "ldrh   {p1:w}, [{probs}, {t}, lsl #1]",
                 decide!(),
                 "strh   {u:w}, [{probs}, {sym}, lsl #1]",
                 "csel   {sym}, {n1}, {n0}, hs",
-                "csel   {prob:w}, {p1:w}, {p0:w}, hs",
+                "csel   {prob:w}, {p1:w}, {v:w}, hs",
                 "cbnz   {cnt:w}, 47b",
                 "sub    {tab:w}, {sym:w}, {step:w}",
                 "b      49f",
@@ -813,7 +830,7 @@ impl Coder<'_> {
                 // back, and the distance is checked for the end marker and
                 // against the window's fill, which is the position until the
                 // window first wraps.
-                "mov    {rep3:w}, {rep2:w}",
+                "str    {rep2}, [{p}, #128]",
                 "mov    {rep2:w}, {rep1:w}",
                 "mov    {rep1:w}, {rep0:w}",
                 "add    {rep0:w}, {tab:w}, #1",
@@ -905,22 +922,55 @@ impl Coder<'_> {
                 "b.ne   55b",
                 "59:",
                 "sub    {t}, {dpos}, #1",
-                "ldrb   {prev:w}, [{dic}, {t}]",
-                next_is_match!("{dpos}"),
-                "ldrh   {prob:w}, [{step}, #{o_is_match}]",
-                "b      10b",
+                "ldrb   {sym:w}, [{dic}, {t}]",
+                next_symbol!("{dpos}"),
+                "ldrh   {prob:w}, [{step}, {n1}]",
+                // ---- After a match: the state is 7 or more, and a literal
+                // is decoded against the byte at the last distance, which
+                // may lie before the window's start and wrap. ----
+                "16:",
+                "cmp    {dpos}, {dlim}",
+                "b.hs   90f",
+                "cmp    {pos}, {stop}",
+                "b.hi   90f",
+                is_match_bit!("20b"),
+                literal_coder!(),
+                "cmp    {state:w}, #10",
+                "sub    {t:w}, {state:w}, #3",
+                "sub    {u:w}, {state:w}, #6",
+                "csel   {state:w}, {t:w}, {u:w}, lo",
+                "sub    {t}, {dpos}, {rep0}",
+                "ldr    {u}, [{p}, #88]",
+                "add    {u}, {t}, {u}",
+                "cmp    {dpos}, {rep0}",
+                "csel   {t}, {u}, {t}, lo",
+                "ldrb   {cnt:w}, [{dic}, {t}]",
+                matched_first!(),
+                matched_step!(),
+                matched_step!(),
+                matched_step!(),
+                matched_step!(),
+                matched_step!(),
+                matched_step!(),
+                matched_last!(),
+                "add    {n0}, {dpos}, #1",
+                next_symbol!("{n0}"),
+                "strb   {sym:w}, [{dic}, {dpos}]",
+                "add    {dpos}, {dpos}, #1",
+                "ldrh   {prob:w}, [{step}, {n1}]",
+                "b      15b",
                 // ---- Exits: the state back into memory, and why. ----
                 "91:",
-                "mov    {sym:w}, #1",
+                "mov    {t:w}, #1",
                 "b      95f",
                 "92:",
-                "mov    {sym:w}, #2",
+                "mov    {t:w}, #2",
                 "b      95f",
                 "93:",
-                "mov    {sym:w}, #3",
+                "mov    {t:w}, #3",
                 "b      95f",
                 "90:",
-                "mov    {sym:w}, #0",
+                "mov    {t:w}, #0",
                 "95:",
                 "ldr    {p}, [sp], #16",
                 "str    {pos}, [{p}, #16]",
@@ -928,9 +978,10 @@ impl Coder<'_> {
                 "str    {dpos}, [{p}, #64]",
                 "str    {state}, [{p}, #96]",
                 "stp    {rep0}, {rep1}, [{p}, #104]",
-                "stp    {rep2}, {rep3}, [{p}, #120]",
-                "str    {prev}, [{p}, #136]",
-                "stp    {cnt}, {sym}, [{p}, #152]",
+                "str    {rep2}, [{p}, #120]",
+                "and    {sym}, {sym}, #0xFF",
+                "str    {sym}, [{p}, #136]",
+                "stp    {cnt}, {t}, [{p}, #152]",
                 p = inout(reg) &mut run as *mut Run => _,
                 probs = out(reg) _,
                 pos = out(reg) _,
@@ -944,10 +995,10 @@ impl Coder<'_> {
                 rep0 = out(reg) _,
                 rep1 = out(reg) _,
                 rep2 = out(reg) _,
-                rep3 = out(reg) _,
-                prev = out(reg) _,
+                stop = out(reg) _,
+                pbm = out(reg) _,
+                pim = out(reg) _,
                 prob = out(reg) _,
-                p0 = out(reg) _,
                 p1 = out(reg) _,
                 sym = out(reg) _,
                 cnt = out(reg) _,
@@ -964,7 +1015,6 @@ impl Coder<'_> {
                 total_bits = const BIT_MODEL_TOTAL_BITS,
                 move_bits = const MOVE_BITS,
                 offset = const BIT_MODEL_OFFSET,
-                pos_bits = const NUM_POS_BITS_MAX,
                 o_is_match = const IS_MATCH * 2,
                 o_literal = const LITERAL * 2,
                 o_is_rep = const IS_REP * 2,
@@ -1062,6 +1112,7 @@ impl LzmaDecoder {
                 0
             },
             lc: self.lc,
+            lp: self.lp,
             lp_mask: (0x100u32 << self.lp) - (0x100u32 >> self.lc),
             pb_mask: (1u32 << self.pb) - 1,
             end_marker: false,
