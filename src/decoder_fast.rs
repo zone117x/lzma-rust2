@@ -830,18 +830,29 @@ impl Coder<'_> {
                 "b.hs   92f",
                 // ---- The copy of `cnt` bytes from `rep0` back. ----
                 "50:",
-                // A source before the window's start, or a copy past the
-                // limit, is Rust's.
-                "cmp    {rep0}, {dpos}",
-                "b.hi   91f",
+                // A copy past the limit is Rust's. A source before the
+                // window's start wraps to its end, unless it would run within
+                // a word of the end, which is Rust's too.
                 "add    {t}, {dpos}, {cnt}",
                 "cmp    {t}, {dlim}",
                 "b.hi   91f",
-                "sub    {n0}, {dpos}, {rep0}",
+                "subs   {n0}, {dpos}, {rep0}",
+                "mov    {u}, {rep0}",
+                "b.hs   56f",
+                "ldr    {u}, [{p}, #88]",
+                "add    {n0}, {n0}, {u}",
+                "add    {sym}, {n0}, {cnt}",
+                "add    {sym}, {sym}, #8",
+                "cmp    {sym}, {u}",
+                "b.hi   91f",
+                "sub    {u}, {u}, {rep0}",
+                "56:",
+                // `u` is how far the source lies from the destination in
+                // memory: a word or more, and the copy goes by words.
                 "add    {n0}, {dic}, {n0}",
                 "add    {n1}, {dic}, {dpos}",
                 "mov    {dpos}, {t}",
-                "cmp    {rep0}, #16",
+                "cmp    {u}, #16",
                 "b.lo   55f",
                 "cmp    {cnt}, #16",
                 "b.lo   53f",
