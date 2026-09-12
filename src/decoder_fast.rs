@@ -64,6 +64,9 @@ const POS_SLOT: usize = IS_REP_G2 + NUM_STATES;
 const LITERAL: usize = POS_SLOT + (NUM_LEN_TO_POS_STATES << NUM_POS_SLOT_BITS);
 const NUM_BASE_PROBS: usize = LITERAL;
 const LIT_SIZE: usize = 0x300;
+/// The stride of the literal coders: a power of two, so that the coder of a
+/// byte is a shift and an add from it, with a quarter of each unused.
+const LIT_STRIDE: usize = 0x400;
 const PROB_INIT: u16 = 1024;
 
 /// The probability update in one form: `prob - ((prob - OFFSET) >> 5)` is
@@ -164,13 +167,13 @@ macro_rules! is_match_bit {
     ($one:literal) => {
         concat!(
             normalize!(),
-            "lsr    {t:w}, {range:w}, #{total_bits}\n",
-            "mul    {t:w}, {t:w}, {prob:w}\n",
-            "cmp    {code:w}, {t:w}\n",
+            "mov    {t:w}, {range:w}\n",
+            "lsr    {range:w}, {range:w}, #{total_bits}\n",
+            "mul    {range:w}, {range:w}, {prob:w}\n",
+            "cmp    {code:w}, {range:w}\n",
             "b.hs   ",
             $one,
             "\n",
-            "mov    {range:w}, {t:w}\n",
             "sub    {u:w}, {prob:w}, #{offset}\n",
             "sub    {u:w}, {prob:w}, {u:w}, asr #{move_bits}\n",
             "strh   {u:w}, [{step}, {n1}]\n",
@@ -184,8 +187,8 @@ macro_rules! is_match_bit {
 // into `prob` as soon as `prob` is free, and the literal coders of the
 // position's `lp` bits into `n0`, so that the coder of the next literal is
 // found from the last byte alone. `masks` holds `8 - lc` in its low byte,
-// the mask of `lc` bits in the next, the position bits' mask in the next,
-// and the `lp` bits' mask shifted by `lc` in its high word.
+// the position bits' mask in its third, and the `lp` bits' mask shifted by
+// `lc` in its high word.
 macro_rules! next_symbol {
     ($pos:literal) => {
         concat!(
@@ -198,26 +201,24 @@ macro_rules! next_symbol {
             ", #8\n",
             "lsr    {n0}, {n0}, {masks}\n",
             "and    {n0}, {n0}, {masks}, lsr #32\n",
-            "add    {t}, {probs}, #{o_literal}\n",
-            "add    {n0}, {n0}, {n0}, lsl #1\n",
-            "add    {n0}, {t}, {n0}, lsl #9\n",
+            "ldr    {t}, [{p}, #168]\n",
+            "add    {n0}, {t}, {n0}, lsl #11\n",
         )
     };
 }
 
 // The coder of a literal, into `tab`: the top `lc` bits of the last byte,
-// `sym`, over the coders of the position in `n0`, each coder 0x300
-// probabilities. This is the chain from the last bit of one literal to the
-// first of the next, so it is as short as it can be: the leading one the
-// byte carries out of its tree goes with the mask.
+// `sym`, over the coders of the position in `n0`, each coder 0x400
+// probabilities apart. This is the chain from the last bit of one literal
+// to the first of the next, so it is as short as it can be: `sym` carries
+// bit 8 above the byte, the leading one of its tree, which the shift
+// leaves at bit `lc`, and the coders' base in `n0` is a coder `1 << lc`
+// back to make up for it.
 macro_rules! literal_coder {
     () => {
         concat!(
-            "ubfx   {t}, {masks}, #8, #8\n",
             "lsr    {tab}, {sym}, {masks}\n",
-            "and    {tab}, {tab}, {t}\n",
-            "add    {tab}, {tab}, {tab}, lsl #1\n",
-            "add    {tab}, {n0}, {tab}, lsl #9\n",
+            "add    {tab}, {n0}, {tab}, lsl #11\n",
         )
     };
 }
@@ -601,13 +602,16 @@ struct Run {
     state: u64,
     reps: [u64; 4],
     previous: u64,
-    /// `lc` in the low byte, the position state mask shifted up by four in
-    /// the next, and the literal position mask shifted by `lc` in the high
-    /// half, so that one shift by the register and one and with it shifted
-    /// down give the literal coder.
+    /// `8 - lc` in the low byte, the position state mask in the third, and
+    /// the literal position mask shifted by `lc` in the high half, so that
+    /// one shift by the register and one and with it shifted down give the
+    /// literal coder.
     masks: u64,
     len: u64,
     exit: u64,
+    /// The literal coders' base, a coder `1 << lc` back, for the leading one
+    /// the byte carries.
+    lit: u64,
 }
 
 const _: () = {
@@ -625,6 +629,7 @@ const _: () = {
     assert!(core::mem::offset_of!(Run, masks) == 144);
     assert!(core::mem::offset_of!(Run, len) == 152);
     assert!(core::mem::offset_of!(Run, exit) == 160);
+    assert!(core::mem::offset_of!(Run, lit) == 168);
 };
 
 /// The range coder over a buffer, for the kernel.
@@ -667,11 +672,13 @@ impl Coder<'_> {
             reps: st.reps.map(u64::from),
             previous: u64::from(st.previous),
             masks: u64::from(8 - st.lc)
-                | (((1u64 << st.lc) - 1) << 8)
                 | (u64::from(st.pb_mask) << 16)
                 | ((((1u64 << st.lp) - 1) << st.lc) << 32),
             len: 0,
             exit: 0,
+            lit: (probs.as_mut_ptr() as u64)
+                .wrapping_add((LITERAL * 2) as u64)
+                .wrapping_sub(((LIT_STRIDE * 2) as u64) << st.lc),
         };
 
         // SAFETY: the kernel reads and writes only `run`, the probabilities
@@ -697,6 +704,7 @@ impl Coder<'_> {
                 "ldr    {state}, [{p}, #96]",
                 "ldr    {rep0}, [{p}, #104]",
                 "ldp    {sym}, {masks}, [{p}, #136]",
+                "orr    {sym}, {sym}, #0x100",
                 "ubfx   {pbm}, {masks}, #16, #4",
                 "lsl    {pbm}, {pbm}, #5",
                 "add    {pim}, {probs}, #{o_is_match}",
@@ -747,8 +755,8 @@ impl Coder<'_> {
                 "b      11b",
                 // ---- A match: the is-rep and repeat bits sit at the state. ----
                 "20:",
-                "sub    {range:w}, {range:w}, {t:w}",
-                "sub    {code:w}, {code:w}, {t:w}",
+                "sub    {code:w}, {code:w}, {range:w}",
+                "sub    {range:w}, {t:w}, {range:w}",
                 "sub    {u:w}, {prob:w}, {prob:w}, lsr #{move_bits}",
                 "strh   {u:w}, [{step}, {n1}]",
                 // The state's other tables lie at fixed offsets from its
@@ -986,27 +994,33 @@ impl Coder<'_> {
                 // Fewer than sixteen: a word, then a masked word with the
                 // destination's own bytes past the match kept, when the
                 // window has that word of room.
+                // The match's last byte, the next literal's context, is read
+                // from the source here, which the copy does not reach: the
+                // source lies a word or more behind and the rest is shorter
+                // than a word. The other copies read it back from the window.
+                "sub    {sym}, {cnt}, #1",
+                "ldrb   {sym:w}, [{n0}, {sym}]",
                 "cmp    {cnt}, #8",
                 "b.lo   54f",
                 "ldr    {t}, [{n0}], #8",
                 "str    {t}, [{n1}], #8",
                 "subs   {cnt}, {cnt}, #8",
-                "b.eq   59f",
+                "b.eq   58f",
                 "54:",
                 "ldr    {step}, [{p}, #88]",
-                "add    {sym}, {dpos}, #8",
-                "cmp    {sym}, {step}",
+                "add    {t}, {dpos}, #8",
+                "cmp    {t}, {step}",
                 "b.hi   55f",
                 "ldr    {t}, [{n0}]",
                 "ldr    {u}, [{n1}]",
                 "lsl    {step}, {cnt}, #3",
-                "mov    {sym}, #-1",
-                "lsl    {sym}, {sym}, {step}",
-                "and    {u}, {u}, {sym}",
-                "bic    {t}, {t}, {sym}",
+                "mov    {v}, #-1",
+                "lsl    {v}, {v}, {step}",
+                "and    {u}, {u}, {v}",
+                "bic    {t}, {t}, {v}",
                 "orr    {t}, {t}, {u}",
                 "str    {t}, [{n1}]",
-                "b      59f",
+                "b      58f",
                 "55:",
                 // A source within sixteen bytes of the destination, or a copy
                 // at the window's end: a byte at a time, as the source may be
@@ -1015,9 +1029,13 @@ impl Coder<'_> {
                 "strb   {t:w}, [{n1}], #1",
                 "subs   {cnt}, {cnt}, #1",
                 "b.ne   55b",
+                "mov    {sym}, {t}",
+                "b      58f",
                 "59:",
                 "sub    {t}, {dpos}, #1",
                 "ldrb   {sym:w}, [{dic}, {t}]",
+                "58:",
+                "orr    {sym}, {sym}, #0x100",
                 next_symbol!("{dpos}"),
                 "ldrh   {prob:w}, [{step}, {n1}]",
                 // ---- After a match: the state is 7 or more, and a literal
@@ -1155,7 +1173,6 @@ impl Coder<'_> {
                 move_bits = const MOVE_BITS,
                 offset = const BIT_MODEL_OFFSET,
                 o_is_match = const IS_MATCH * 2,
-                o_literal = const LITERAL * 2,
                 r_is_rep = const (IS_REP - IS_MATCH) * 2,
                 r_is_rep_g0 = const (IS_REP_G0 - IS_MATCH) * 2,
                 r_is_rep_g1 = const (IS_REP_G1 - IS_MATCH) * 2,
@@ -1202,7 +1219,7 @@ pub(crate) struct LzmaDecoder {
 
 impl LzmaDecoder {
     pub(crate) fn new(lc: u32, lp: u32, pb: u32) -> Self {
-        let probs = vec![PROB_INIT; NUM_BASE_PROBS + (LIT_SIZE << (lc + lp))];
+        let probs = vec![PROB_INIT; NUM_BASE_PROBS + (LIT_STRIDE << (lc + lp))];
         Self {
             probs,
             lc,
@@ -1391,7 +1408,7 @@ impl LzmaDecoder {
         let mut state = st.state as usize;
         if rc.decode_bit(&mut probs[IS_MATCH + (pos_state << NUM_POS_BITS_MAX) + state]) == 0 {
             let context = (((lz.get_pos() as u32) << 8) + st.previous) & st.lp_mask;
-            let base = LITERAL + 3 * (context << st.lc) as usize;
+            let base = LITERAL + (((context << st.lc) as usize) << 2);
             let symbol = if state < NUM_LIT_STATES {
                 state -= if state < 4 { state } else { 3 };
                 Self::tree(rc, &mut probs[base..base + 0x100])
