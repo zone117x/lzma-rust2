@@ -289,6 +289,13 @@ impl WindowParts<'_> {
         self.buf.get(offset).copied().unwrap_or(0)
     }
 
+    /// The byte before the position, for the literal context after a copy,
+    /// which leaves the position past at least one byte.
+    #[inline(always)]
+    pub(crate) fn last_byte(&self) -> u8 {
+        self.buf[self.pos - 1]
+    }
+
     #[inline(always)]
     pub(crate) fn put_byte(&mut self, b: u8) {
         self.buf[self.pos] = b;
@@ -322,6 +329,9 @@ impl WindowParts<'_> {
             let word = (u128::from_le_bytes(dst) & keep) | (u128::from_le_bytes(src) & !keep);
             self.buf[pos..pos + 16].copy_from_slice(&word.to_le_bytes());
             self.pos = pos + len;
+            // The whole match is copied, so nothing is pending, which matters
+            // when this was the pending rest of a match the limit had cut.
+            self.pending_len = 0;
             return Ok(());
         }
         let mut left = usize::min(self.limit - self.pos, len);
