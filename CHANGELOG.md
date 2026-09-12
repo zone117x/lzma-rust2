@@ -28,8 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   symbols: the range coder, the window's position, the state and the repeat distances stay in registers from one
   symbol to the next, and both children of a bit tree node are loaded before the bit that chooses between them is
   known, the way the LZMA SDK's arm64 decoder works. The decoder that carries it keeps its probabilities in the layout
-  of 7-Zip's `LzmaDec.c`. It decodes about 1.4 times faster than the Rust decoder, level with 7-Zip's own arm64
-  build; other targets keep the decoder they had.
+  of 7-Zip's `LzmaDec.c`. It decodes about 1.5 times faster than the Rust decoder and about 1.1 times faster than
+  7-Zip's own arm64 build; other targets keep the decoder they had.
 - A match shorter than sixteen bytes whose source lies a word or more from its destination in the window is copied as
   one masked word rather than through `memcpy`, on every target.
 - The CRC-32 of lzip and xz and the CRC-64 of xz are computed eight bytes at a time, and on aarch64 the `optimization`
