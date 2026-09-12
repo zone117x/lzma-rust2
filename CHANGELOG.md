@@ -29,6 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   chooses between them is known, the trick of the LZMA SDK's arm64 decoder. The decoder that carries them keeps its
   probabilities in the layout of 7-Zip's `LzmaDec.c`, and the range coder's and the window's state in locals over a
   run of symbols. It decodes about 1.25 times faster than the Rust decoder; other targets keep the decoder they had.
+- A match shorter than sixteen bytes whose source lies a word or more from its destination in the window is copied as
+  one masked word rather than through `memcpy`, on every target.
 - The CRC-32 of lzip and xz and the CRC-64 of xz are computed eight bytes at a time, and on aarch64 the `optimization`
   feature uses the processor's CRC-32 instructions where they are present. They went byte by byte before.
 - The reserved bits of the XZ stream header flags are now all checked, and come back as `Unsupported` instead of

@@ -330,8 +330,31 @@ impl WindowParts<'_> {
 
         if dist >= left {
             // No overlap possible. We can copy directly.
-            let (src_part, dst_part) = self.buf.split_at_mut(self.pos);
-            dst_part[..left].copy_from_slice(&src_part[back..back + left]);
+            if left < 8 && back + 8 <= self.pos && self.pos + 8 <= self.buf_size {
+                // A short copy as one word: the source's word, and the
+                // destination's own bytes past the match kept, so that there
+                // is no loop and no call for the two to seven bytes most
+                // matches are.
+                let mut src = [0; 8];
+                src.copy_from_slice(&self.buf[back..back + 8]);
+                let mut dst = [0; 8];
+                dst.copy_from_slice(&self.buf[self.pos..self.pos + 8]);
+                let keep = u64::MAX << (8 * left);
+                let word = (u64::from_le_bytes(dst) & keep) | (u64::from_le_bytes(src) & !keep);
+                self.buf[self.pos..self.pos + 8].copy_from_slice(&word.to_le_bytes());
+            } else if left < 16 && back + 16 <= self.pos && self.pos + 16 <= self.buf_size {
+                // The same with a double word for eight to fifteen bytes.
+                let mut src = [0; 16];
+                src.copy_from_slice(&self.buf[back..back + 16]);
+                let mut dst = [0; 16];
+                dst.copy_from_slice(&self.buf[self.pos..self.pos + 16]);
+                let keep = u128::MAX << (8 * left);
+                let word = (u128::from_le_bytes(dst) & keep) | (u128::from_le_bytes(src) & !keep);
+                self.buf[self.pos..self.pos + 16].copy_from_slice(&word.to_le_bytes());
+            } else {
+                let (src_part, dst_part) = self.buf.split_at_mut(self.pos);
+                dst_part[..left].copy_from_slice(&src_part[back..back + left]);
+            }
             self.pos += left;
         } else {
             loop {
