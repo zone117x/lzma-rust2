@@ -300,6 +300,30 @@ impl WindowParts<'_> {
         if dist >= self.full() {
             return Err(error_other("dist overflow"));
         }
+        // The common case first, in one test: a match shorter than a double
+        // word, whose source lies that far behind without wrapping, with
+        // that much room in the window and inside the limit. It is copied as
+        // one double word read from the source and one from the destination,
+        // with the destination's own bytes past the match kept, so that there
+        // is no loop and no call for the few bytes most matches are.
+        let pos = self.pos;
+        if len < 16
+            && dist + 1 <= pos
+            && dist + 1 >= 16
+            && pos + 16 <= self.buf_size
+            && pos + len <= self.limit
+        {
+            let back = pos - dist - 1;
+            let mut src = [0; 16];
+            src.copy_from_slice(&self.buf[back..back + 16]);
+            let mut dst = [0; 16];
+            dst.copy_from_slice(&self.buf[pos..pos + 16]);
+            let keep = u128::MAX << (8 * len);
+            let word = (u128::from_le_bytes(dst) & keep) | (u128::from_le_bytes(src) & !keep);
+            self.buf[pos..pos + 16].copy_from_slice(&word.to_le_bytes());
+            self.pos = pos + len;
+            return Ok(());
+        }
         let mut left = usize::min(self.limit - self.pos, len);
         self.pending_len = len - left;
         self.pending_dist = dist;
